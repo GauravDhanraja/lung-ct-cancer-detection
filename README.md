@@ -10,14 +10,14 @@ CT Scan (.mhd)
      │
      ▼
 ┌─────────────────────────────┐
-│  PREPROCESSING               │
-│  • Resample → 1mm isotropic  │
-│  • Clip & normalise HU       │
-│  • Patch / crop extraction   │
+│  PREPROCESSING              │
+│  • Resample → 1mm isotropic │
+│  • Clip & normalise HU      │
+│  • Patch / crop extraction  │
 └────────────┬────────────────┘
              │  64³ patches
              ▼
-┌─────────────────────────────┐
+┌──────────────────────────────┐
 │  STAGE 1: 3D U-Net DETECTOR  │
 │  • 4-level encoder/decoder   │
 │  • Skip connections          │
@@ -25,35 +25,35 @@ CT Scan (.mhd)
 │  • Focal + Dice loss         │
 │  → Probability map           │
 │  → Candidate extraction (NMS)│
-└────────────┬────────────────┘
+└────────────┬─────────────────┘
              │  32³ nodule crops
              ▼
-┌─────────────────────────────┐
-│  STAGE 2: ResNet-10 CLASSIFIER│
-│  • SE attention blocks       │
-│  • Mixup augmentation        │
-│  • Label smoothing BCE       │
-│  → Malignancy probability    │
-└────────────┬────────────────┘
+┌────────────────────────────────┐
+│  STAGE 2: ResNet-10 CLASSIFIER │
+│  • SE attention blocks         │
+│  • Mixup augmentation          │
+│  • Label smoothing BCE         │
+│  → Malignancy probability      │
+└────────────┬───────────────────┘
              │
              ▼
-┌─────────────────────────────┐
+┌──────────────────────────────┐
 │  STAGE 3: GRAD-CAM 3D        │
 │  • Gradient-based attention  │
 │  • Axial/coronal/sagittal    │
 │  • Score-CAM (gradient-free) │
-└─────────────────────────────┘
+└──────────────────────────────┘
 ```
 
 ---
 
 ## VRAM Budget (4 GB GPU)
 
-| Component            | Patch Size | Batch | VRAM Usage |
-|---------------------|-----------|-------|-----------|
-| UNet3D (detector)   | 64³        | 2     | ~2.8 GB   |
-| ResNet-10 (classif) | 32³        | 8     | ~0.6 GB   |
-| Grad-CAM            | 32³        | 1     | ~0.4 GB   |
+| Component           | Patch Size | Batch | VRAM Usage |
+|---------------------|------------|-------|------------|
+| UNet3D (detector)   | 64³        | 2     | ~2.8 GB    |
+| ResNet-10 (classif) | 32³        | 8     | ~0.6 GB    |
+| Grad-CAM            | 32³        | 1     | ~0.4 GB    |
 
 All models use **FP16 (AMP)** + **gradient checkpointing** (UNet3D) to stay under 4 GB.
 
@@ -63,7 +63,7 @@ All models use **FP16 (AMP)** + **gradient checkpointing** (UNet3D) to stay unde
 
 LUNA16 is a subset of **LIDC-IDRI** (the largest public lung nodule database).
 
-| Property            | Value                       |
+| Property           | Value                       |
 |--------------------|-----------------------------|
 | CT scans           | 888 scans                   |
 | Annotated nodules  | 1,186 nodules               |
@@ -469,12 +469,12 @@ Repeat Part 2 exactly for each new subset. The steps are always identical:
 Reduce additional epochs each round — the model is already partially trained:
 
 | Round | Subsets Added  | Extra Detector Epochs | Extra Classifier Epochs |
-|-------|---------------|-----------------------|------------------------|
-| 1     | subset0        | 60 (full)             | 80 (full)              |
-| 2     | + subset1      | 30                    | 40                     |
-| 3     | + subset2      | 25                    | 35                     |
-| 4     | + subset3      | 20                    | 30                     |
-| 5     | + subset4–6    | 15                    | 25                     |
+|-------|----------------|-----------------------|-------------------------|
+| 1     | subset0        | 60 (full)             | 80 (full)               |
+| 2     | + subset1      | 30                    | 40                      |
+| 3     | + subset2      | 25                    | 35                      |
+| 4     | + subset3      | 20                    | 30                      |
+| 5     | + subset4–6    | 15                    | 25                      |
 
 ---
 
