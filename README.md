@@ -167,10 +167,6 @@ pip install torch torchvision torchaudio \
 python -c "import torch; print(torch.__version__); \
     print('GPU:', torch.cuda.is_available()); \
     print(torch.cuda.get_device_name(0))"
-# Expected:
-# 2.9.0+cu126
-# GPU: True
-# NVIDIA GeForce RTX XXXX
 ```
 
 ### Step 5 — Install remaining dependencies
@@ -186,14 +182,6 @@ python -c "import SimpleITK, monai, sklearn, matplotlib; print('All imports OK')
 
 ```bash
 python main.py test
-# Expected output:
-# ✓ UNet3D forward pass
-# ✓ ResNet3D forward pass + features
-# ✓ FocalDiceLoss
-# ✓ Grad-CAM 3D
-# ✓ Classification metrics
-# ✓ Preprocessing utilities
-# Tests passed: 6/6
 ```
 
 > ⚠️ Fix any failing tests before proceeding. Do not skip this step.
@@ -202,37 +190,21 @@ python main.py test
 
 ```bash
 python main.py demo
-# Creates fake CT data, runs the full pipeline end-to-end
-# Saves sample outputs to results/demo/
-# Takes ~2 minutes — useful to preview outputs before real training
 ```
 
 ### Step 8 — Preprocess subset0
 
-This is the longest step. It reads all 89 CT scans, resamples them, and extracts patches.
+It reads all 89 CT scans, resamples them, and extracts patches.
 
 ```bash
 python main.py preprocess
-# - Loads each .mhd from subset0/
-# - Resamples to 1mm isotropic spacing
-# - Normalises HU values to [0, 1]
-# - Extracts 64³ detector patches (positive + negative)
-# - Extracts 32³ classifier crops (nodule only)
-# - Saves everything as .npz files
-#
-# Expected totals at completion:
-#   Detector patches — total: ~4000, pos: ~800, neg: ~3200
-#   Classifier crops — total: ~150
-#
-# Time: 30–60 minutes
-# Skipped scans print a warning — that is OK
 ```
 
 Verify after completion:
 
 ```bash
-ls data/processed/detector_patches/ | wc -l   # ~4000
-ls data/processed/classifier_crops/  | wc -l   # ~150
+ls data/processed/detector_patches/ | wc -l
+ls data/processed/classifier_crops/  | wc -l
 ```
 
 ### Step 9 — Record a processing snapshot
@@ -246,8 +218,6 @@ echo "subset0 processed on $(date)" >> data/processed/processing_log.txt
 ls data/processed/detector_patches/ | wc -l >> data/processed/processing_log.txt
 
 cat data/processed/processing_log.txt
-# subset0 processed on Mon Mar 17 2026
-# 4012
 ```
 
 ### Step 10 — Train the detector (Stage 1)
@@ -264,54 +234,18 @@ Back in the main terminal:
 
 ```bash
 python main.py train-det
-# - Loads all .npz patches from detector_patches/
-# - Trains 3D U-Net with FocalDiceLoss
-# - FP16 (AMP) + gradient checkpointing active (4 GB safe)
-# - Saves best model whenever val loss improves
-# - Early stopping after 15 epochs with no improvement
-#
-# Watch in TensorBoard:
-#   loss:        ~0.9 → ~0.3
-#   dice:        ~0.1 → ~0.5+
-#   sensitivity: increases over time
-#
-# Time: 4–8 hours for 60 epochs on subset0
-# Best checkpoint → checkpoints/detector_best.pth
 ```
 
 ### Step 11 — Train the classifier (Stage 2)
 
 ```bash
 python main.py train-cls
-# - Loads all .npz crops from classifier_crops/
-# - Trains 3D ResNet-10 with LabelSmoothingBCE
-# - Mixup augmentation on 50% of batches
-# - Saves best model whenever val AUC improves
-#
-# Watch in TensorBoard:
-#   loss: ~0.7 → ~0.3
-#   AUC:  ~0.5 → ~0.75+
-#
-# Time: 2–4 hours for 80 epochs on subset0
-# Best checkpoint → checkpoints/classifier_best.pth
 ```
 
 ### Step 12 — Evaluate
 
 ```bash
 python main.py evaluate
-# Outputs written to results/:
-#   roc_curve.png
-#   eval_metrics.json
-#   detector_training_curves.png
-#   classifier_training_curves.png
-#
-# Terminal summary (expected for subset0 only):
-#   AUC-ROC:     ~0.78
-#   Sensitivity: ~0.75
-#   Specificity: ~0.72
-#   CPM:         ~0.65–0.70
-# (performance improves as more subsets are added)
 ```
 
 ### Step 13 — Save baseline checkpoint
@@ -370,10 +304,6 @@ mv data/LUNA16/subset0 data/LUNA16/subset0_DONE
 
 ```bash
 python main.py preprocess
-# Processes only subset1
-# New patches → data/processed/detector_patches/
-# New crops   → data/processed/classifier_crops/
-# Time: 30–60 minutes
 ```
 
 ### Step 5 — Restore and merge
@@ -405,10 +335,6 @@ echo "subset1 added on $(date)" >> data/processed/processing_log.txt
 ls data/processed/detector_patches/ | wc -l >> data/processed/processing_log.txt
 
 cat data/processed/processing_log.txt
-# subset0 processed on Mon Mar 17 2026
-# 4012
-# subset1 added on Tue Mar 18 2026
-# 8100
 ```
 
 ### Step 7 — Resume detector training
@@ -417,10 +343,6 @@ cat data/processed/processing_log.txt
 python main.py train-det \
     --resume checkpoints/detector_best.pth \
     --epochs 30
-# Loads existing weights + optimiser state + LR schedule
-# 30 additional epochs on the combined subset0 + subset1 patches
-# Overwrites detector_best.pth if val loss improves
-# Time: 2–4 hours
 ```
 
 ### Step 8 — Resume classifier training
@@ -429,10 +351,6 @@ python main.py train-det \
 python main.py train-cls \
     --resume checkpoints/classifier_best.pth \
     --epochs 40
-# Resumes from existing checkpoint
-# Trains on crops from both subsets
-# AUC expected to improve from ~0.78 to ~0.82+
-# Time: 1–2 hours
 ```
 
 ### Step 9 — Re-evaluate and compare
