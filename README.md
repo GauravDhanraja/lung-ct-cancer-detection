@@ -122,15 +122,10 @@ lung_nodule_ai/
 
 ## Part 1 — First-Time Setup & Training (subset0)
 
-### Step 1 — Create folder structure
+### Step 1 — Clone repository
 
 ```bash
-mkdir -p lung_nodule_ai/data/LUNA16
-mkdir -p lung_nodule_ai/data/processed/detector_patches
-mkdir -p lung_nodule_ai/data/processed/classifier_crops
-mkdir -p lung_nodule_ai/checkpoints
-mkdir -p lung_nodule_ai/logs
-mkdir -p lung_nodule_ai/results
+git clone https://github.com/GauravDhanraja/lung-ct-cancer-detection.git
 ```
 
 ### Step 2 — Place LUNA16 data
