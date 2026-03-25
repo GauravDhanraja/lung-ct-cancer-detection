@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import (roc_auc_score, average_precision_score,
@@ -111,7 +111,7 @@ def tta_predict(model: nn.Module,
         aug = np.rot90(aug, k, axes=(1, 2))
 
         aug_t = torch.from_numpy(aug.copy()).unsqueeze(0).unsqueeze(0).to(device)
-        with autocast(enabled=(device == "cuda")):
+        with autocast("cuda", enabled=(device == "cuda")):
             logit = model(aug_t)
         probs.append(torch.sigmoid(logit).item())
 
@@ -138,12 +138,12 @@ def train_epoch(model, loader, optimizer, loss_fn, scaler,
         if use_mixup and np.random.rand() > 0.5:
             mixed_vol, lbl_a, lbl_b, lam = mixup_batch(volumes, labels)
             optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=(device == "cuda")):
+            with autocast("cuda", enabled=(device == "cuda")):
                 logits = model(mixed_vol)
                 loss   = mixup_loss(loss_fn, logits, lbl_a, lbl_b, lam)
         else:
             optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=(device == "cuda")):
+            with autocast("cuda", enabled=(device == "cuda")):
                 logits = model(volumes)
                 loss   = loss_fn(logits, labels)
 
@@ -186,7 +186,7 @@ def val_epoch(model, loader, loss_fn, device) -> Dict:
         volumes = volumes.to(device, non_blocking=True)
         labels  = labels.to(device, non_blocking=True)
 
-        with autocast(enabled=(device == "cuda")):
+        with autocast("cuda", enabled=(device == "cuda")):
             logits = model(volumes)
             loss   = loss_fn(logits, labels)
 
@@ -270,13 +270,13 @@ def train_classifier(
     optimizer = optim.AdamW(model.parameters(), lr=lr,
                              weight_decay=cfg.CLASSIFIER_WEIGHT_DECAY)
     scheduler = WarmupCosineScheduler(optimizer, cfg.WARMUP_EPOCHS, epochs)
-    scaler    = GradScaler(enabled=(cfg.USE_AMP and device == "cuda"))
+    scaler    = GradScaler("cuda", enabled=(cfg.USE_AMP and device == "cuda"))
 
     # Resume
     start_epoch  = 0
     best_val_auc = 0.0
     if resume_from and Path(resume_from).exists():
-        ckpt = torch.load(resume_from, map_location=device)
+        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch  = ckpt["epoch"] + 1
