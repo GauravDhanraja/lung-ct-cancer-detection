@@ -245,7 +245,7 @@ def compute_classification_metrics(
 
     # Precision-Recall
     prec, rec, pr_thresh = precision_recall_curve(y_true, y_prob)
-    avg_prec = float(np.trapezoid(rec[::-1], prec[::-1]))  # AP
+    avg_prec = float(np.trapz(rec[::-1], prec[::-1]))  # AP
 
     # Youden's J index (maximise sens + spec)
     j_scores     = tpr - fpr

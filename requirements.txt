@@ -1,111 +1,17 @@
-# ─────────────────────────────────────────────────────────────────
-# Lung Nodule AI — requirements.txt
-# 3D Deep Learning for CT Nodule Detection & Malignancy Prediction
-#
-# Tested configuration:
-#   Python   3.11.x   (via pyenv — see note below)
-#   CUDA     13.1     (driver) + 12.6 (toolkit wheels — backward compatible)
-#   OS       Arch Linux
-#   GPU      4 GB VRAM minimum
-#
-# ⚠ IMPORTANT — Python 3.14 + CUDA 13.1 compatibility note:
-#   Python 3.14 only has CPU-only PyTorch wheels right now (as of March 2026).
-#   CUDA 13.1 has no standard pip wheels — only NVIDIA NGC containers.
-#   Solution: use Python 3.11 via pyenv + CUDA 12.6 wheels (driver-compatible).
-#
-# SETUP STEPS:
-#   1. pyenv install 3.11.9
-#      pyenv local 3.11.9
-#   2. python -m venv venv && source venv/bin/activate
-#   3. pip install torch torchvision torchaudio \
-#          --index-url https://download.pytorch.org/whl/cu126
-#   4. pip install -r requirements.txt
-#   5. python -c "import torch; print(torch.cuda.is_available())"
-# ─────────────────────────────────────────────────────────────────
-
-
-# ── Core Deep Learning ────────────────────────────────────────────
-# Install torch SEPARATELY first (see step 3 above) — do not include
-# torch here or pip will pull the CPU-only version from PyPI.
-#
-# torch>=2.9.0          <- install via --index-url cu126 wheel instead
-# torchvision>=0.20.0   <- install via --index-url cu126 wheel instead
-# torchaudio>=2.6.0     <- install via --index-url cu126 wheel instead
-
-
-# ── Scientific Computing ──────────────────────────────────────────
-numpy>=1.26.0
-scipy>=1.11.0
-pandas>=2.0.0
-
-
-# ── Medical Imaging I/O ───────────────────────────────────────────
-SimpleITK>=2.3.0
-nibabel>=5.2.0
-pydicom>=2.4.0
-
-
-# ── Machine Learning Utilities ────────────────────────────────────
-scikit-learn>=1.4.0
-
-
-# ── Visualisation ─────────────────────────────────────────────────
-matplotlib>=3.8.0
-seaborn>=0.13.0
-
-
-# ── Training Utilities ────────────────────────────────────────────
-tqdm>=4.66.0
-tensorboard>=2.15.0
-
-
-# ── Augmentation ──────────────────────────────────────────────────
-# Use headless version on Arch Linux to avoid GUI dependency issues
-opencv-python-headless>=4.9.0
-albumentations>=1.4.0
-
-
-# ── 3D Medical Imaging Framework ─────────────────────────────────
-monai>=1.3.0
-
-
-# ── Tensor Operations ─────────────────────────────────────────────
-einops>=0.7.0
-
-
-# ── PDF Report Generation ─────────────────────────────────────────
-reportlab>=4.1.0
-
-
-# ── Web Demo (optional) ───────────────────────────────────────────
-streamlit>=1.32.0
-
-
-# ── Notebook Support (optional) ───────────────────────────────────
-jupyter>=1.0.0
-ipywidgets>=8.1.0
-ipykernel>=6.29.0
-
-
-# ─────────────────────────────────────────────────────────────────
-# ARCH LINUX SPECIFIC NOTES
-# ─────────────────────────────────────────────────────────────────
-#
-# If SimpleITK build fails:
-#   pip install SimpleITK --extra-index-url https://pypi.org/simple/
-#
-# If opencv-python-headless fails:
-#   sudo pacman -S python-opencv   (system package, skip pip version)
-#
-# If monai has issues:
-#   pip install monai[all]
-#
-# Verify your full setup:
-#   python -c "
-#   import torch, SimpleITK, monai, sklearn, matplotlib
-#   print('torch:    ', torch.__version__, '| CUDA:', torch.cuda.is_available())
-#   print('device:   ', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')
-#   print('SimpleITK:', SimpleITK.Version())
-#   print('monai:    ', monai.__version__)
-#   "
-# ─────────────────────────────────────────────────────────────────
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+SimpleITK>=2.2.0
+pandas>=1.5.0
+scikit-learn>=1.2.0
+scipy>=1.10.0
+matplotlib>=3.6.0
+seaborn>=0.12.0
+tqdm>=4.65.0
+opencv-python>=4.7.0
+nibabel>=5.0.0
+pydicom>=2.3.0
+albumentations>=1.3.0
+tensorboard>=2.12.0
+einops>=0.6.0
+monai>=1.2.0

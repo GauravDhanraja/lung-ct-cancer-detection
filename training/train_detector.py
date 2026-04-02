@@ -19,7 +19,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
@@ -104,7 +104,7 @@ def train_epoch(model: nn.Module,
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast("cuda", enabled=(device == "cuda")):
+        with autocast(enabled=(device == "cuda")):
             logits = model(volumes)
             loss   = loss_fn(logits, labels)
 
@@ -145,7 +145,7 @@ def val_epoch(model: nn.Module,
         volumes = volumes.to(device, non_blocking=True)
         labels  = labels.to(device, non_blocking=True)
 
-        with autocast("cuda", enabled=(device == "cuda")):
+        with autocast(enabled=(device == "cuda")):
             logits = model(volumes)
             loss   = loss_fn(logits, labels)
 
@@ -210,13 +210,13 @@ def train_detector(
                              weight_decay=cfg.DETECTOR_WEIGHT_DECAY)
     scheduler = WarmupCosineScheduler(optimizer, cfg.WARMUP_EPOCHS, epochs)
     loss_fn   = FocalDiceLoss()
-    scaler    = GradScaler("cuda", enabled=(cfg.USE_AMP and device == "cuda"))
+    scaler    = GradScaler(enabled=(cfg.USE_AMP and device == "cuda"))
 
     # ── Optional resume ──
     start_epoch = 0
     best_val_loss = float("inf")
     if resume_from and Path(resume_from).exists():
-        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        ckpt = torch.load(resume_from, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch  = ckpt["epoch"] + 1

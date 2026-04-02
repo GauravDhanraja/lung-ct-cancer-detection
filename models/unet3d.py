@@ -179,7 +179,7 @@ class UNet3D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_checkpoint:
-            e0, e1, e2, e3, bn = checkpoint(self._encode, x, use_reentrant=False)
+            e0, e1, e2, e3, bn = checkpoint(self._encode, x)
         else:
             e0, e1, e2, e3, bn = self._encode(x)
 

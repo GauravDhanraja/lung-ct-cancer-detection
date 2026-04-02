@@ -408,86 +408,56 @@ class LUNA16Preprocessor:
     # ────────────────────────────────
 
     def run(self, max_scans: Optional[int] = None):
-        """
-        Process all LUNA16 scans and save patches to disk.
-        Memory-safe: saves each scan's patches immediately and
-        deletes the volume from RAM before loading the next scan.
-        Peak RAM usage is now ~1-2 GB regardless of dataset size.
-        """
-        import gc
-
+        """Process all LUNA16 scans and save patches to disk."""
         all_uids = self.candidates["seriesuid"].unique()
         if max_scans:
             all_uids = all_uids[:max_scans]
 
-        # Running counters for patch file naming
-        det_idx = 0
-        cls_idx = 0
-
-        # Summary counters (no data stored in memory)
-        total_det = 0
-        total_pos = 0
-        total_cls = 0
-        total_mal = 0
+        det_patches  = []
+        cls_crops    = []
 
         print(f"[Preprocessor] Processing {len(all_uids)} scans...")
-        print(f"[Preprocessor] Patches saved to disk scan-by-scan (memory-safe mode)\n")
-
         for uid in tqdm(all_uids, desc="Scans"):
             try:
-                # ── Load + process one scan ──
                 info = self.process_scan(uid)
                 if info is None:
                     continue
-
-                # ── Generate patches for this scan ──
-                det_patches = self.generate_detector_patches(info)
-                cls_crops   = self.generate_classifier_crops(info)
-
-                # ── Save detector patches immediately ──
-                for p in det_patches:
-                    np.savez_compressed(
-                        cfg.DETECTOR_PATCHES_DIR / f"patch_{det_idx:06d}.npz",
-                        volume     = p["volume"],
-                        label      = p["label"],
-                        is_nodule  = np.array(p["is_nodule"]),
-                        uid        = np.array(p["uid"]),
-                        centre_zyx = p["centre_zyx"],
-                        radius_vox = np.array(p["radius_vox"])
-                    )
-                    total_pos += p["is_nodule"]
-                    det_idx   += 1
-
-                # ── Save classifier crops immediately ──
-                for c in cls_crops:
-                    np.savez_compressed(
-                        cfg.CLASSIFIER_CROPS_DIR / f"crop_{cls_idx:06d}.npz",
-                        volume      = c["volume"],
-                        label       = np.array(c["label"]),
-                        uid         = np.array(c["uid"]),
-                        diameter_mm = np.array(c["diameter_mm"])
-                    )
-                    total_mal += c["label"]
-                    cls_idx   += 1
-
-                total_det += len(det_patches)
-                total_cls += len(cls_crops)
-
-                # ── Free memory before next scan ──
-                # This is the critical step — delete the full CT volume
-                del info, det_patches, cls_crops
-                gc.collect()
-
+                det_patches.extend(self.generate_detector_patches(info))
+                cls_crops.extend(self.generate_classifier_crops(info))
             except Exception as e:
                 print(f"  ⚠  Skipping {uid}: {e}")
 
-        total_neg = total_det - total_pos
-        total_ben = total_cls - total_mal
-        print(f"\n✓ Detector patches  — total: {total_det}, "
-              f"pos: {total_pos}, neg: {total_neg}, "
-              f"ratio: {total_neg/max(total_pos,1):.1f}:1")
-        print(f"✓ Classifier crops  — total: {total_cls}, "
-              f"malignant: {total_mal}, benign: {total_ben}")
+        # Save
+        print(f"[Preprocessor] Saving {len(det_patches)} detector patches...")
+        for i, p in enumerate(det_patches):
+            np.savez_compressed(
+                cfg.DETECTOR_PATCHES_DIR / f"patch_{i:06d}.npz",
+                volume     = p["volume"],
+                label      = p["label"],
+                is_nodule  = np.array(p["is_nodule"]),
+                uid        = np.array(p["uid"]),
+                centre_zyx = p["centre_zyx"],
+                radius_vox = np.array(p["radius_vox"])
+            )
+
+        print(f"[Preprocessor] Saving {len(cls_crops)} classifier crops...")
+        for i, c in enumerate(cls_crops):
+            np.savez_compressed(
+                cfg.CLASSIFIER_CROPS_DIR / f"crop_{i:06d}.npz",
+                volume      = c["volume"],
+                label       = np.array(c["label"]),
+                uid         = np.array(c["uid"]),
+                diameter_mm = np.array(c["diameter_mm"])
+            )
+
+        pos = sum(1 for p in det_patches if p["is_nodule"])
+        neg = len(det_patches) - pos
+        print(f"\n✓ Detector patches  — total: {len(det_patches)}, "
+              f"pos: {pos}, neg: {neg}, ratio: {neg/max(pos,1):.1f}:1")
+        mal = sum(1 for c in cls_crops if c["label"] == 1)
+        ben = len(cls_crops) - mal
+        print(f"✓ Classifier crops  — total: {len(cls_crops)}, "
+              f"malignant: {mal}, benign: {ben}")
 
 
 # ═══════════════════════════════════════════════════════

@@ -43,7 +43,7 @@ def load_detector(ckpt_path: Optional[str] = None,
                   device: str = "cuda") -> UNet3D:
     model = UNet3D(use_checkpoint=False).to(device)
     if ckpt_path and Path(ckpt_path).exists():
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model"])
         print(f"Detector loaded from {ckpt_path}")
     else:
@@ -56,7 +56,7 @@ def load_classifier(ckpt_path: Optional[str] = None,
                     device: str = "cuda") -> ResNet3D:
     model = ResNet3D(use_se=True, dropout=0.0).to(device)
     if ckpt_path and Path(ckpt_path).exists():
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model"])
         print(f"Classifier loaded from {ckpt_path}")
     else:
