@@ -92,8 +92,12 @@ class Augment3D:
 
     @staticmethod
     def _resize_to(vol: np.ndarray, target_shape: Tuple) -> np.ndarray:
-        """Centre-crop or zero-pad vol to target_shape."""
+        """Centre-crop or zero-pad vol to target_shape.
+        Handles zero-size dimensions safely by returning zeros."""
         result = np.zeros(target_shape, dtype=vol.dtype)
+        # If any dimension is 0, just return zeros — nothing to copy
+        if any(s == 0 for s in vol.shape):
+            return result
         slices_src = []
         slices_dst = []
         for s_vol, s_tgt in zip(vol.shape, target_shape):
@@ -159,13 +163,21 @@ class LunaDetectorDataset(Dataset):
         label     = data["label"].astype(np.float32)    # (1, D, H, W)
         is_nodule = int(data["is_nodule"])
 
+        # ── Guard: force correct shape (64,64,64) ──
+        # Some edge-case patches saved with wrong dims (e.g. [1,0,64,64])
+        # due to CT volumes smaller than patch size. Resize to correct shape.
+        ps = cfg.DETECTOR_PATCH_SIZE  # (64, 64, 64)
+        if volume.shape[1:] != ps:
+            volume = Augment3D._resize_to(volume[0], ps)[np.newaxis]
+            label  = Augment3D._resize_to(label[0],  ps)[np.newaxis]
+
         # Augment (squeeze channel for aug, then restore)
         vol_aug, lbl_aug = self.augment(volume[0], label[0])
         volume = vol_aug[np.newaxis]
         label  = lbl_aug[np.newaxis]
 
-        return (torch.from_numpy(volume),
-                torch.from_numpy(label),
+        return (torch.from_numpy(volume.copy()),
+                torch.from_numpy(label.copy()),
                 torch.tensor(is_nodule, dtype=torch.long))
 
     def get_sampler(self) -> WeightedRandomSampler:
@@ -237,10 +249,15 @@ class LunaClassifierDataset(Dataset):
         d_mm   = float(data["diameter_mm"])
         uid    = str(data["uid"])
 
+        # ── Guard: force correct shape (32,32,32) ──
+        cs = cfg.CLASSIFIER_CROP_SIZE  # (32, 32, 32)
+        if volume.shape[1:] != cs:
+            volume = Augment3D._resize_to(volume[0], cs)[np.newaxis]
+
         vol_aug, _ = self.augment(volume[0], None)
         volume = vol_aug[np.newaxis]
 
-        return (torch.from_numpy(volume),
+        return (torch.from_numpy(volume.copy()),
                 torch.tensor(label, dtype=torch.long),
                 {"diameter_mm": d_mm, "uid": uid})
 

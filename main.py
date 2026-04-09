@@ -65,7 +65,7 @@ def main():
     args = parse_args()
 
     print(f"\n{'═'*60}")
-    print(f"  🫁 Lung Nodule AI  —  Stage: {args.stage.upper()}")
+    print(f"  Lung Nodule AI  —  Stage: {args.stage.upper()}")
     print(f"{'═'*60}\n")
 
     # ── DEMO ──────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ def run_evaluation(args):
     import json
     import torch
     import numpy as np
-    from torch.cuda.amp import autocast
+    from torch.amp import autocast
     from tqdm import tqdm
     from models.unet3d import UNet3D
     from models.resnet3d import ResNet3D
@@ -162,7 +162,7 @@ def run_evaluation(args):
     classifier = ResNet3D(use_se=True, dropout=0.0).to(device)
 
     if cls_ckpt.exists():
-        ckpt = torch.load(cls_ckpt, map_location=device)
+        ckpt = torch.load(cls_ckpt, map_location=device, weights_only=False)
         classifier.load_state_dict(ckpt["model"])
         print(f"Loaded classifier: {cls_ckpt}")
     else:
@@ -182,7 +182,7 @@ def run_evaluation(args):
     with torch.no_grad():
         for vols, labels, _ in tqdm(val_loader, desc="Classifying"):
             vols   = vols.to(device)
-            with autocast(enabled=(device == "cuda")):
+            with autocast("cuda", enabled=(device == "cuda")):
                 probs = torch.sigmoid(classifier(vols)).cpu().squeeze().float()
             all_probs.append(probs)
             all_labels.append(labels.float())
@@ -336,7 +336,7 @@ def run_unit_tests():
     print(f"\n{'─'*40}")
     print(f"  Tests passed: {tests_passed}/6")
     if tests_passed == 6:
-        print("  🎉 All tests passed!")
+        print("  All tests passed!")
     else:
         print("  ⚠  Some tests failed — check errors above.")
 

@@ -19,7 +19,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
@@ -104,7 +104,7 @@ def train_epoch(model: nn.Module,
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=(device == "cuda")):
+        with autocast("cuda", enabled=(device == "cuda")):
             logits = model(volumes)
             loss   = loss_fn(logits, labels)
 
@@ -145,7 +145,7 @@ def val_epoch(model: nn.Module,
         volumes = volumes.to(device, non_blocking=True)
         labels  = labels.to(device, non_blocking=True)
 
-        with autocast(enabled=(device == "cuda")):
+        with autocast("cuda", enabled=(device == "cuda")):
             logits = model(volumes)
             loss   = loss_fn(logits, labels)
 
@@ -210,23 +210,23 @@ def train_detector(
                              weight_decay=cfg.DETECTOR_WEIGHT_DECAY)
     scheduler = WarmupCosineScheduler(optimizer, cfg.WARMUP_EPOCHS, epochs)
     loss_fn   = FocalDiceLoss()
-    scaler    = GradScaler(enabled=(cfg.USE_AMP and device == "cuda"))
+    scaler    = GradScaler("cuda", enabled=(cfg.USE_AMP and device == "cuda"))
 
     # ── Optional resume ──
-    start_epoch = 0
-    best_val_loss = float("inf")
+    start_epoch   = 0
+    best_val_dice = 0.0          # monitor dice, not loss
     if resume_from and Path(resume_from).exists():
-        ckpt = torch.load(resume_from, map_location=device)
+        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch  = ckpt["epoch"] + 1
-        best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        print(f"Resumed from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
+        start_epoch   = ckpt["epoch"] + 1
+        best_val_dice = ckpt.get("best_val_dice", 0.0)
+        print(f"Resumed from epoch {start_epoch}, best val dice: {best_val_dice:.4f}")
 
     # ── Logging ──
     writer   = SummaryWriter(cfg.LOGS_DIR / "detector")
     history  = {"train": [], "val": []}
-    patience = 15
+    patience = 25                # was 15 — give model more time
     patience_counter = 0
 
     # ── Training loop ──
@@ -257,10 +257,10 @@ def train_detector(
               f"  Val:   loss={val_metrics['loss']:.4f}  dice={val_metrics['dice']:.3f}"
               f"  ({elapsed:.0f}s)")
 
-        # ── Checkpoint ──
-        is_best = val_metrics["loss"] < best_val_loss
+        # ── Checkpoint — save when val DICE improves ──
+        is_best = val_metrics["dice"] > best_val_dice
         if is_best:
-            best_val_loss    = val_metrics["loss"]
+            best_val_dice    = val_metrics["dice"]
             patience_counter = 0
             ckpt = {
                 "epoch"         : epoch,
@@ -268,18 +268,19 @@ def train_detector(
                 "optimizer"     : optimizer.state_dict(),
                 "val_metrics"   : val_metrics,
                 "train_metrics" : train_metrics,
-                "best_val_loss" : best_val_loss
+                "best_val_dice" : best_val_dice
             }
             torch.save(ckpt, cfg.CHECKPOINTS_DIR / "detector_best.pth")
-            print(f"  ★  Saved best detector (val_loss={best_val_loss:.4f})")
+            print(f"  ★  Saved best detector (val_dice={best_val_dice:.4f})")
         else:
             patience_counter += 1
 
-        # Periodic checkpoint
+        # Periodic checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
             torch.save({
-                "epoch": epoch, "model": model.state_dict(),
-                "best_val_loss": best_val_loss
+                "epoch"        : epoch,
+                "model"        : model.state_dict(),
+                "best_val_dice": best_val_dice
             }, cfg.CHECKPOINTS_DIR / f"detector_ep{epoch+1}.pth")
 
         # Early stopping
@@ -294,7 +295,7 @@ def train_detector(
     with open(cfg.RESULTS_DIR / "detector_history.json", "w") as f:
         json.dump(history, f, indent=2)
 
-    print(f"\n✓ Detector training complete. Best val loss: {best_val_loss:.4f}")
+    print(f"\n✓ Detector training complete. Best val dice: {best_val_dice:.4f}")
     print(f"  Checkpoint saved: {cfg.CHECKPOINTS_DIR}/detector_best.pth")
     return model, history
 

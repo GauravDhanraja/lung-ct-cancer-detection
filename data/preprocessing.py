@@ -307,157 +307,211 @@ class LUNA16Preprocessor:
     # DETECTOR PATCH GENERATION
     # ────────────────────────────────
 
-    def generate_detector_patches(self, scan_info: Dict) -> List[Dict]:
-        """
-        Sample 64³ patches:
-          - Around each nodule (positive)
-          - From random lung positions (negative, 3× oversampling)
-        Each patch has a Gaussian sphere segmentation label.
-        """
+    def generate_detector_patches(self, scan_info: Dict):
         vol   = scan_info["volume"]
         nods  = scan_info["nodules"]
         uid   = scan_info["seriesuid"]
-        ps    = cfg.DETECTOR_PATCH_SIZE   # (64, 64, 64)
-        patches = []
+        origin        = scan_info["origin"]
+        resize_factor = scan_info["resize_factor"]
+        ps    = cfg.DETECTOR_PATCH_SIZE
 
         # ── Positive patches ──
         for nod in nods:
             czyx        = nod["zyx"]
             radius_vox  = nod["radius_vox"]
-            patch_vol   = extract_patch(vol, czyx, ps)
-            # Label: Gaussian blob centred at patch centre
-            centre_in_patch = np.array([ps[0]//2, ps[1]//2, ps[2]//2], dtype=float)
-            label = make_gaussian_sphere(ps, centre_in_patch, radius_vox)
-            patches.append({
-                "volume": patch_vol[np.newaxis],   # (1, D, H, W)
-                "label" : label[np.newaxis],
-                "uid"   : uid,
+
+            patch_vol = extract_patch(vol, czyx, ps)
+            centre = np.array([ps[0]//2, ps[1]//2, ps[2]//2], dtype=float)
+            label = make_gaussian_sphere(ps, centre, radius_vox)
+
+            yield {
+                "volume": patch_vol[np.newaxis],
+                "label": label[np.newaxis],
+                "uid": uid,
                 "is_nodule": 1,
                 "centre_zyx": czyx,
                 "radius_vox": radius_vox
-            })
+            }
 
-        # ── Negative patches (3× positive count, minimum 6) ──
-        n_neg = max(len(nods) * 3, 6)
+        # ── Hard negatives ──
+        n_neg  = max(len(nods) * 3, 6)
+
         Z, Y, X = vol.shape
         hz, hy, hx = ps[0]//2, ps[1]//2, ps[2]//2
+        hard_neg_coords = []
+
+        if uid in self.cand_by_uid.groups:
+            cand_df = self.cand_by_uid.get_group(uid)
+            fp_df = cand_df[cand_df["class"] == 0]
+
+            for _, row in fp_df.iterrows():
+                world_xyz = np.array([row.coordX, row.coordY, row.coordZ])
+
+                vox_zyx_orig = world_to_voxel(
+                    world_xyz, origin, np.array(cfg.TARGET_SPACING)[::-1]
+                )
+                vox_zyx = vox_zyx_orig * resize_factor
+
+                cz, cy, cx = vox_zyx
+                if (hz <= cz < Z - hz and
+                    hy <= cy < Y - hy and
+                    hx <= cx < X - hx):
+
+                    too_close = any(
+                        np.linalg.norm(vox_zyx - nod["zyx"]) < nod["radius_vox"] * 2
+                        for nod in nods
+                    )
+
+                    if not too_close:
+                        hard_neg_coords.append(vox_zyx)
+
+        np.random.shuffle(hard_neg_coords)
+
+        count = 0
+        for czyx in hard_neg_coords:
+            if count >= n_neg:
+                break
+
+            patch_vol = extract_patch(vol, czyx, ps)
+            label = np.zeros((1, *ps), dtype=np.float32)
+
+            yield {
+                "volume": patch_vol[np.newaxis],
+                "label": label,
+                "uid": uid,
+                "is_nodule": 0,
+                "centre_zyx": czyx,
+                "radius_vox": 0.0
+            }
+            count += 1
+
+        # ── Random negatives ──
         added = 0
         attempts = 0
-        while added < n_neg and attempts < n_neg * 20:
+
+        while added < (n_neg - count) and attempts < n_neg * 20:
             attempts += 1
+
             cz = np.random.randint(hz, Z - hz)
             cy = np.random.randint(hy, Y - hy)
             cx = np.random.randint(hx, X - hx)
             czyx = np.array([cz, cy, cx], dtype=float)
-            # Reject if too close to any nodule
-            too_close = False
-            for nod in nods:
-                dist = np.linalg.norm(czyx - nod["zyx"])
-                if dist < nod["radius_vox"] * 2:
-                    too_close = True
-                    break
+
+            too_close = any(
+                np.linalg.norm(czyx - nod["zyx"]) < nod["radius_vox"] * 2
+                for nod in nods
+            )
+
             if too_close:
                 continue
+
             patch_vol = extract_patch(vol, czyx, ps)
-            label     = np.zeros((1, *ps), dtype=np.float32)
-            patches.append({
+            label = np.zeros((1, *ps), dtype=np.float32)
+
+            yield {
                 "volume": patch_vol[np.newaxis],
-                "label" : label,
-                "uid"   : uid,
+                "label": label,
+                "uid": uid,
                 "is_nodule": 0,
                 "centre_zyx": czyx,
                 "radius_vox": 0.0
-            })
+            }
+
             added += 1
 
-        return patches
 
-    # ────────────────────────────────
-    # CLASSIFIER CROP GENERATION
-    # ────────────────────────────────
+# ────────────────────────────────
+# CLASSIFIER CROPS (STREAMING)
+# ────────────────────────────────
 
-    def generate_classifier_crops(self, scan_info: Dict) -> List[Dict]:
-        """
-        32³ crops centred on annotated nodules.
-        Label = 1 if diameter ≥ LUNA16 malignancy proxy (≥ 10mm), else 0.
-        (True malignancy labels require LIDC-IDRI XML; this is a size proxy.)
-        """
+    def generate_classifier_crops(self, scan_info: Dict):
         vol   = scan_info["volume"]
         nods  = scan_info["nodules"]
         uid   = scan_info["seriesuid"]
-        cs    = cfg.CLASSIFIER_CROP_SIZE    # (32, 32, 32)
-        crops = []
+        cs    = cfg.CLASSIFIER_CROP_SIZE
 
         for nod in nods:
             czyx  = nod["zyx"]
             d_mm  = nod["diameter_mm"]
-            crop  = extract_patch(vol, czyx, cs)
-            # Proxy: ≥ 10 mm diameter → likely malignant (adjust if LIDC XML available)
+
+            crop = extract_patch(vol, czyx, cs)
             label = int(d_mm >= 10.0)
-            crops.append({
-                "volume": crop[np.newaxis],   # (1, 32, 32, 32)
-                "label" : label,
-                "uid"   : uid,
+
+            yield {
+                "volume": crop[np.newaxis],
+                "label": label,
+                "uid": uid,
                 "diameter_mm": d_mm
-            })
+            }
 
-        return crops
 
-    # ────────────────────────────────
-    # RUN FULL PIPELINE
-    # ────────────────────────────────
+# ────────────────────────────────
+# RUN FUNCTION (STREAMING SAVE)
+# ────────────────────────────────
 
     def run(self, max_scans: Optional[int] = None):
-        """Process all LUNA16 scans and save patches to disk."""
+        import gc
+
         all_uids = self.candidates["seriesuid"].unique()
         if max_scans:
             all_uids = all_uids[:max_scans]
 
-        det_patches  = []
-        cls_crops    = []
+        det_idx = 0
+        cls_idx = 0
 
-        print(f"[Preprocessor] Processing {len(all_uids)} scans...")
+        total_det = 0
+        total_pos = 0
+        total_cls = 0
+        total_mal = 0
+
+        print(f"[Preprocessor] Processing {len(all_uids)} scans...\n")
+
         for uid in tqdm(all_uids, desc="Scans"):
             try:
                 info = self.process_scan(uid)
                 if info is None:
                     continue
-                det_patches.extend(self.generate_detector_patches(info))
-                cls_crops.extend(self.generate_classifier_crops(info))
+
+                # ── Detector patches (streaming) ──
+                for p in self.generate_detector_patches(info):
+                    np.savez_compressed(
+                        cfg.DETECTOR_PATCHES_DIR / f"patch_{det_idx:06d}.npz",
+                        volume=p["volume"],
+                        label=p["label"],
+                        is_nodule=np.array(p["is_nodule"]),
+                        uid=np.array(p["uid"]),
+                        centre_zyx=p["centre_zyx"],
+                        radius_vox=np.array(p["radius_vox"])
+                    )
+                    total_pos += p["is_nodule"]
+                    det_idx += 1
+                    total_det += 1
+
+                # ── Classifier crops (streaming) ──
+                for c in self.generate_classifier_crops(info):
+                    np.savez_compressed(
+                        cfg.CLASSIFIER_CROPS_DIR / f"crop_{cls_idx:06d}.npz",
+                        volume=c["volume"],
+                        label=np.array(c["label"]),
+                        uid=np.array(c["uid"]),
+                        diameter_mm=np.array(c["diameter_mm"])
+                    )
+                    total_mal += c["label"]
+                    cls_idx += 1
+                    total_cls += 1
+
+                # ── Free memory ──
+                del info
+                gc.collect()
+
             except Exception as e:
-                print(f"  ⚠  Skipping {uid}: {e}")
+                print(f"⚠ Skipping {uid}: {e}")
 
-        # Save
-        print(f"[Preprocessor] Saving {len(det_patches)} detector patches...")
-        for i, p in enumerate(det_patches):
-            np.savez_compressed(
-                cfg.DETECTOR_PATCHES_DIR / f"patch_{i:06d}.npz",
-                volume     = p["volume"],
-                label      = p["label"],
-                is_nodule  = np.array(p["is_nodule"]),
-                uid        = np.array(p["uid"]),
-                centre_zyx = p["centre_zyx"],
-                radius_vox = np.array(p["radius_vox"])
-            )
+        total_neg = total_det - total_pos
+        total_ben = total_cls - total_mal
 
-        print(f"[Preprocessor] Saving {len(cls_crops)} classifier crops...")
-        for i, c in enumerate(cls_crops):
-            np.savez_compressed(
-                cfg.CLASSIFIER_CROPS_DIR / f"crop_{i:06d}.npz",
-                volume      = c["volume"],
-                label       = np.array(c["label"]),
-                uid         = np.array(c["uid"]),
-                diameter_mm = np.array(c["diameter_mm"])
-            )
-
-        pos = sum(1 for p in det_patches if p["is_nodule"])
-        neg = len(det_patches) - pos
-        print(f"\n✓ Detector patches  — total: {len(det_patches)}, "
-              f"pos: {pos}, neg: {neg}, ratio: {neg/max(pos,1):.1f}:1")
-        mal = sum(1 for c in cls_crops if c["label"] == 1)
-        ben = len(cls_crops) - mal
-        print(f"✓ Classifier crops  — total: {len(cls_crops)}, "
-              f"malignant: {mal}, benign: {ben}")
+        print(f"\n✓ Detector patches — total: {total_det}, pos: {total_pos}, neg: {total_neg}")
+        print(f"✓ Classifier crops — total: {total_cls}, malignant: {total_mal}, benign: {total_ben}")
 
 
 # ═══════════════════════════════════════════════════════
