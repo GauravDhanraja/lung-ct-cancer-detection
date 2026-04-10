@@ -62,7 +62,7 @@ GAUSSIAN_SIGMA_RATIO = 0.3   # sigma = radius * 0.3
 # ─────────────────────────────────────────────
 CLASSIFIER_CROP_SIZE  = (32, 32, 32)   # centred on detected nodule
 CLASSIFIER_BATCH_SIZE = 4
-CLASSIFIER_EPOCHS     = 80
+CLASSIFIER_EPOCHS     = 100
 CLASSIFIER_LR         = 2e-5
 CLASSIFIER_WEIGHT_DECAY = 1e-4
 NUM_CLASSES           = 1              # binary: benign / malignant
@@ -71,7 +71,7 @@ NUM_CLASSES           = 1              # binary: benign / malignant
 MALIGNANCY_THRESHOLD  = 3
 
 # Class-weighted loss (malignant << benign in LUNA16)
-POS_WEIGHT            = 2.0
+POS_WEIGHT            = 1.0
 
 # ─────────────────────────────────────────────
 # TRAINING UTILITIES

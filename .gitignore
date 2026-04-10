@@ -1,4 +1,5 @@
 /data/LUNA16
 /data/processed
-/data_bak
+checkpoints/
+logs/
 **/__pycache__/**

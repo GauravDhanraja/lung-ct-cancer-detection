@@ -133,7 +133,7 @@ class ResNet3D(nn.Module):
                  base_channels:  int   = 32,
                  num_classes:    int   = cfg.NUM_CLASSES,
                  use_se:         bool  = True,
-                 dropout:        float = 0.4):
+                 dropout:        float = 0.2):
         super().__init__()
         bc  = base_channels
         Block = SEBasicBlock3D if use_se else BasicBlock3D
@@ -167,13 +167,13 @@ class ResNet3D(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out',
                                         nonlinearity='relu')
                 if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                    if m.bias is not None: nn.init.zeros_(m.bias)
             elif isinstance(m, nn.BatchNorm3d):
                 nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+                if m.bias is not None: nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
-                nn.init.zeros_(m.bias)
+                if m.bias is not None: nn.init.zeros_(m.bias)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """
