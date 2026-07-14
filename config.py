@@ -71,7 +71,7 @@ NUM_CLASSES           = 1              # binary: benign / malignant
 MALIGNANCY_THRESHOLD  = 3
 
 # Class-weighted loss (malignant << benign in LUNA16)
-POS_WEIGHT            = 1.0
+POS_WEIGHT            = 1
 
 # ─────────────────────────────────────────────
 # TRAINING UTILITIES
