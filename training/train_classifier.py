@@ -123,41 +123,46 @@ def tta_predict(model: nn.Module,
 # ═══════════════════════════════════════════════════════
 
 def train_epoch(model, loader, optimizer, loss_fn, scaler,
-                device, use_mixup=False) -> Dict:
+                device, use_mixup=False, accum_steps=1) -> Dict:
     model.train()
     total_loss = 0.
     all_logits, all_labels = [], []
     n_batches = 0
 
     bar = tqdm(loader, desc="  Train", leave=False, ncols=90)
-    for volumes, labels, _ in bar:
+    optimizer.zero_grad(set_to_none=True)
+    n_steps = len(loader)
+    for i, (volumes, labels, _) in enumerate(bar):
         volumes = volumes.to(device, non_blocking=True)
         labels  = labels.to(device, non_blocking=True)
 
         # Mixup
         if use_mixup and np.random.rand() > 0.5:
             mixed_vol, lbl_a, lbl_b, lam = mixup_batch(volumes, labels)
-            optimizer.zero_grad(set_to_none=True)
             with autocast("cuda", enabled=(device == "cuda")):
                 logits = model(mixed_vol)
-                loss   = mixup_loss(loss_fn, logits, lbl_a, lbl_b, lam)
+                loss   = mixup_loss(loss_fn, logits, lbl_a, lbl_b, lam) / accum_steps
         else:
-            optimizer.zero_grad(set_to_none=True)
             with autocast("cuda", enabled=(device == "cuda")):
                 logits = model(volumes)
-                loss   = loss_fn(logits, labels)
+                loss   = loss_fn(logits, labels) / accum_steps
 
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-        scaler.step(optimizer)
-        scaler.update()
 
-        total_loss += loss.item()
+        is_last = (i + 1) == n_steps
+        if (i + 1) % accum_steps == 0 or is_last:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        step_loss = loss.item() * accum_steps
+        total_loss += step_loss
         all_logits.append(logits.detach().cpu().float().sigmoid().squeeze())
         all_labels.append(labels.detach().cpu().float())
         n_batches += 1
-        bar.set_postfix(loss=f"{loss.item():.4f}")
+        bar.set_postfix(loss=f"{step_loss:.4f}")
 
     all_logits = torch.cat(all_logits).numpy()
     all_labels = torch.cat(all_labels).numpy()
@@ -238,14 +243,19 @@ def train_classifier(
         lr:             float = cfg.CLASSIFIER_LR,
         batch_size:     int   = cfg.CLASSIFIER_BATCH_SIZE,
         use_mixup:      bool  = False,
+        accum_steps:    int   = cfg.CLASSIFIER_GRAD_ACCUM_STEPS,
         device:         str   = "auto"
 ):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = cfg.CUDNN_BENCHMARK
 
     print(f"\n{'='*60}")
     print(f"  3D ResNet-10 Classifier Training")
     print(f"  Device: {device}  |  Mixup: {use_mixup}  |  Epochs: {epochs}")
+    print(f"  Batch: {batch_size}  (x{accum_steps} accum = "
+          f"{batch_size*accum_steps} effective)")
     print(f"{'='*60}\n")
 
     torch.manual_seed(cfg.SEED)
@@ -256,7 +266,7 @@ def train_classifier(
         print("⚠  Using SYNTHETIC data")
         from torch.utils.data import random_split
         full_ds = SyntheticNoduleDataset(n_samples=300,
-                                          patch_size=(32,32,32),
+                                          patch_size=cfg.CLASSIFIER_CROP_SIZE,
                                           mode="classifier")
         train_ds, val_ds = random_split(full_ds, [240, 60])
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -265,7 +275,8 @@ def train_classifier(
         train_loader, val_loader = get_classifier_loaders(batch_size=batch_size)
 
     # ── Model ──
-    model   = ResNet3D(use_se=True, dropout=0.4).to(device)
+    model   = ResNet3D(base_channels=cfg.CLASSIFIER_BASE_CHANNELS,
+                        use_se=True, dropout=0.4).to(device)
     loss_fn = LabelSmoothingBCE(smoothing=0.0)
     total, trainable = count_params(model)
     print(f"Parameters: {total/1e6:.3f}M\n")
@@ -288,15 +299,28 @@ def train_classifier(
 
     writer  = SummaryWriter(cfg.LOGS_DIR / "classifier")
     history = {"train": [], "val": []}
-    patience, patience_counter = 25, 0
+    # Bumped from 25: batch 4->32 means ~8x fewer optimizer steps per epoch,
+    # so it takes a few more epochs to see whether AUC is really plateauing.
+    patience, patience_counter = 35, 0
 
     for epoch in range(start_epoch, epochs):
         t0 = time.time()
         scheduler.step(epoch)
         lr_now = optimizer.param_groups[0]['lr']
 
-        train_m = train_epoch(model, train_loader, optimizer, loss_fn,
-                               scaler, device, use_mixup)
+        try:
+            train_m = train_epoch(model, train_loader, optimizer, loss_fn,
+                                   scaler, device, use_mixup, accum_steps)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    f"CUDA OOM at epoch {epoch+1}. Try lowering "
+                    f"CLASSIFIER_BATCH_SIZE (currently {batch_size}) and "
+                    f"raising CLASSIFIER_GRAD_ACCUM_STEPS to compensate, or "
+                    f"lowering CLASSIFIER_BASE_CHANNELS / CLASSIFIER_CROP_SIZE."
+                ) from e
+            raise
         val_m   = val_epoch(model, val_loader, loss_fn, device)
 
         elapsed = time.time() - t0
@@ -362,6 +386,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr",          type=float, default=cfg.CLASSIFIER_LR)
     parser.add_argument("--no-mixup",    action="store_true")
     parser.add_argument("--resume",      type=str,   default=None)
+    parser.add_argument("--accum-steps", type=int,   default=cfg.CLASSIFIER_GRAD_ACCUM_STEPS,
+                        help="Gradient accumulation steps (effective batch = batch_size * accum_steps)")
     parser.add_argument("--device",      type=str,   default="auto")
     args = parser.parse_args()
 
@@ -372,5 +398,6 @@ if __name__ == "__main__":
         lr            = args.lr,
         batch_size    = args.batch_size,
         use_mixup     = not args.no_mixup,
+        accum_steps   = args.accum_steps,
         device        = args.device
     )

@@ -253,18 +253,20 @@ if __name__ == "__main__":
     print("=" * 50)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model  = ResNet3D(use_se=True, dropout=0.4).to(device)
+    model  = ResNet3D(base_channels=cfg.CLASSIFIER_BASE_CHANNELS,
+                       use_se=True, dropout=0.4).to(device)
     loss_fn = LabelSmoothingBCE()
 
     total, trainable = count_params(model)
     print(f"Parameters: {total/1e6:.3f}M total, {trainable/1e6:.3f}M trainable")
 
-    # Forward pass
-    batch  = torch.randn(8, 1, 32, 32, 32).to(device)
+    # Forward pass — mirrors the real training shape (config-driven crop/batch)
+    c = cfg.CLASSIFIER_CROP_SIZE
+    batch  = torch.randn(8, 1, *c).to(device)
     labels = torch.tensor([0,1,0,1,0,1,0,1], dtype=torch.long).to(device)
 
-    from torch.cuda.amp import autocast
-    with autocast(enabled=device=="cuda"):
+    from torch.amp import autocast
+    with autocast("cuda", enabled=device=="cuda"):
         logits = model(batch)
         loss   = loss_fn(logits, labels)
         probs  = torch.sigmoid(logits)

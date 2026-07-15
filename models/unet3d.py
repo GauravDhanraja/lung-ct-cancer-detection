@@ -301,20 +301,24 @@ if __name__ == "__main__":
     print("=" * 50)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model  = UNet3D(use_checkpoint=True).to(device)
+    model  = UNet3D(channels=cfg.DETECTOR_CHANNELS,
+                     use_checkpoint=cfg.DETECTOR_USE_CHECKPOINT).to(device)
     loss_fn = FocalDiceLoss()
 
     total, trainable = count_params(model)
     print(f"Parameters: {total/1e6:.2f}M total, {trainable/1e6:.2f}M trainable")
 
-    # Forward pass
-    batch = torch.randn(2, 1, 64, 64, 64).to(device)
-    label = torch.zeros(2, 1, 64, 64, 64).to(device)
-    # Add a fake nodule blob in the label
-    label[:, :, 28:36, 28:36, 28:36] = 0.8
+    # Forward pass — mirrors the real training shape (config-driven patch/batch)
+    p = cfg.DETECTOR_PATCH_SIZE
+    b = cfg.DETECTOR_BATCH_SIZE
+    batch = torch.randn(b, 1, *p).to(device)
+    label = torch.zeros(b, 1, *p).to(device)
+    # Add a fake nodule blob in the label, centred, ~1/4 of the patch wide
+    c0, c1 = p[0]//2 - p[0]//8, p[0]//2 + p[0]//8
+    label[:, :, c0:c1, c0:c1, c0:c1] = 0.8
 
-    from torch.cuda.amp import autocast
-    with autocast(enabled=device=="cuda"):
+    from torch.amp import autocast
+    with autocast("cuda", enabled=device=="cuda"):
         logits = model(batch)
         loss   = loss_fn(logits, label)
 

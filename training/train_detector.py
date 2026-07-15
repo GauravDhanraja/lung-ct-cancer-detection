@@ -91,36 +91,42 @@ def train_epoch(model: nn.Module,
                 optimizer: optim.Optimizer,
                 loss_fn: nn.Module,
                 scaler: GradScaler,
-                device: str) -> Dict:
+                device: str,
+                accum_steps: int = 1) -> Dict:
     model.train()
     total_loss = 0.0
     all_metrics = {"dice": 0., "iou": 0., "sensitivity": 0., "specificity": 0.}
     n_batches  = 0
 
     bar = tqdm(loader, desc="  Train", leave=False, ncols=90)
-    for volumes, labels, _ in bar:
+    optimizer.zero_grad(set_to_none=True)
+    n_steps = len(loader)
+    for i, (volumes, labels, _) in enumerate(bar):
         volumes = volumes.to(device, non_blocking=True)
         labels  = labels.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
-
         with autocast("cuda", enabled=(device == "cuda")):
             logits = model(volumes)
-            loss   = loss_fn(logits, labels)
+            loss   = loss_fn(logits, labels) / accum_steps
 
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-        scaler.step(optimizer)
-        scaler.update()
 
-        total_loss += loss.item()
+        is_last = (i + 1) == n_steps
+        if (i + 1) % accum_steps == 0 or is_last:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        step_loss = loss.item() * accum_steps   # undo the accum scaling for logging
+        total_loss += step_loss
         m = batch_metrics(logits, labels)
         for k in all_metrics:
             all_metrics[k] += m[k]
         n_batches += 1
 
-        bar.set_postfix(loss=f"{loss.item():.4f}", dice=f"{m['dice']:.3f}")
+        bar.set_postfix(loss=f"{step_loss:.4f}", dice=f"{m['dice']:.3f}")
 
     avg = {k: v / max(n_batches, 1) for k, v in all_metrics.items()}
     avg["loss"] = total_loss / max(n_batches, 1)
@@ -170,15 +176,23 @@ def train_detector(
         epochs:          int  = cfg.DETECTOR_EPOCHS,
         lr:              float = cfg.DETECTOR_LR,
         batch_size:      int  = cfg.DETECTOR_BATCH_SIZE,
-        use_checkpoint:  bool = True,    # gradient checkpointing
+        use_checkpoint:  bool = cfg.DETECTOR_USE_CHECKPOINT,  # gradient checkpointing
+        accum_steps:     int  = cfg.DETECTOR_GRAD_ACCUM_STEPS,
         device:          str  = "auto"
 ):
     # ── Setup ──
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = cfg.CUDNN_BENCHMARK  # fixed patch
+        # size per stage, so letting cuDNN autotune conv algorithms is safe
+        # and typically gives a meaningful speedup on Ampere/Blackwell cards
+
     print(f"\n{'='*60}")
     print(f"  3D U-Net Detector Training")
     print(f"  Device: {device}  |  AMP: {cfg.USE_AMP}  |  Epochs: {epochs}")
+    print(f"  Batch: {batch_size}  (x{accum_steps} accum = "
+          f"{batch_size*accum_steps} effective)  |  Checkpointing: {use_checkpoint}")
     print(f"{'='*60}\n")
 
     torch.manual_seed(cfg.SEED)
@@ -188,7 +202,8 @@ def train_detector(
     if use_synthetic:
         print("⚠  Using SYNTHETIC data (for testing — no LUNA16 required)")
         from torch.utils.data import random_split
-        full_ds = SyntheticNoduleDataset(n_samples=400, mode="detector")
+        full_ds = SyntheticNoduleDataset(n_samples=400, mode="detector",
+                                          patch_size=cfg.DETECTOR_PATCH_SIZE)
         n_val   = 80
         train_ds, val_ds = random_split(full_ds, [320, n_val])
         train_loader = DataLoader(train_ds, batch_size=batch_size,
@@ -235,8 +250,20 @@ def train_detector(
         scheduler.step(epoch)
         current_lr = optimizer.param_groups[0]['lr']
 
-        train_metrics = train_epoch(model, train_loader, optimizer,
-                                     loss_fn, scaler, device)
+        try:
+            train_metrics = train_epoch(model, train_loader, optimizer,
+                                         loss_fn, scaler, device, accum_steps)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    f"CUDA OOM at epoch {epoch+1}. Try, in order: (1) set "
+                    f"use_checkpoint=True if it's currently False, (2) lower "
+                    f"DETECTOR_BATCH_SIZE (currently {batch_size}) and raise "
+                    f"DETECTOR_GRAD_ACCUM_STEPS to compensate, (3) lower "
+                    f"DETECTOR_PATCH_SIZE in config.py."
+                ) from e
+            raise
         val_metrics   = val_epoch(model, val_loader, loss_fn, device)
 
         elapsed = time.time() - t0
@@ -309,6 +336,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int,   default=cfg.DETECTOR_BATCH_SIZE)
     parser.add_argument("--lr",         type=float, default=cfg.DETECTOR_LR)
     parser.add_argument("--resume",     type=str,   default=None)
+    parser.add_argument("--accum-steps", type=int,  default=cfg.DETECTOR_GRAD_ACCUM_STEPS,
+                        help="Gradient accumulation steps (effective batch = batch_size * accum_steps)")
+    parser.add_argument("--no-checkpoint", action="store_true",
+                        help="Disable gradient checkpointing (faster, uses more VRAM)")
     parser.add_argument("--device",     type=str,   default="auto")
     args = parser.parse_args()
 
@@ -318,5 +349,7 @@ if __name__ == "__main__":
         epochs         = args.epochs,
         lr             = args.lr,
         batch_size     = args.batch_size,
+        use_checkpoint = cfg.DETECTOR_USE_CHECKPOINT and not args.no_checkpoint,
+        accum_steps    = args.accum_steps,
         device         = args.device
     )

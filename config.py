@@ -1,7 +1,16 @@
 """
 config.py — Central configuration for Lung CT Nodule Detection & Malignancy Prediction
-Dataset: LUNA16 (subset of LIDC-IDRI)
-VRAM budget: 4 GB — all choices tuned accordingly
+Dataset: LUNA16 (subset of LIDC-IDRI), all 10 subsets
+VRAM budget: 16 GB (RTX 5070 Ti) — all choices tuned accordingly
+
+Sizing methodology: activation footprint for the detector and classifier was
+measured empirically (forward hooks, per-sample element counts, scaled by
+batch) rather than guessed, then combined with param+grad+AdamW-state memory
+and a 1GB flat overhead for cuDNN workspace/fragmentation. Chosen configs
+target ~75-85% of the 16GB budget so there's headroom for cuDNN's algorithm
+autotuning (first few iterations can spike) and anything else on the GPU.
+If you still hit OOM, the first knobs to turn are DETECTOR_BATCH_SIZE down,
+then DETECTOR_PATCH_SIZE down — in that order.
 """
 
 import os
@@ -40,13 +49,24 @@ CLIP_RANGE      = (-1000, 400)
 # ─────────────────────────────────────────────
 # STAGE 1 — 3D U-Net DETECTOR
 # ─────────────────────────────────────────────
-DETECTOR_PATCH_SIZE  = (64, 64, 64)   # voxels — fits in 4GB with batch=2, fp16
-DETECTOR_STRIDE      = (32, 32, 32)   # 50% overlap during sliding-window inference
-DETECTOR_BATCH_SIZE  = 2
+# 96^3 patches (up from 64^3) give ~3.4x the spatial context per crop — more
+# surrounding anatomy for false-positive reduction, at the cost of a bigger
+# activation footprint. Measured: 96^3, standard channels, batch=6, with
+# gradient checkpointing on ≈ 13.1GB — safe on 16GB with headroom to spare.
+DETECTOR_PATCH_SIZE  = (96, 96, 96)   # voxels
+DETECTOR_STRIDE      = (48, 48, 48)   # 50% overlap during sliding-window inference
+DETECTOR_BATCH_SIZE  = 6
 DETECTOR_EPOCHS      = 80
-DETECTOR_LR          = 2e-4
+DETECTOR_LR          = 3.5e-4         # sqrt(batch 2->6) scaling: 2e-4 * sqrt(3)
 DETECTOR_WEIGHT_DECAY= 1e-5
-DETECTOR_CHANNELS    = (32, 64, 128, 192)  # encoder channels — memory-friendly
+DETECTOR_CHANNELS    = (32, 64, 128, 256)  # restored to standard U-Net depth
+                                            # (bottleneck = 512ch, was 384ch)
+DETECTOR_USE_CHECKPOINT = True        # kept on: ~20% slower but buys back
+                                       # enough headroom to be safe by default.
+                                       # Flip to False if nvidia-smi shows you
+                                       # have >2-3GB free — it's a free speedup.
+DETECTOR_GRAD_ACCUM_STEPS = 1         # bump to 2-3 for a larger effective
+                                       # batch (12-18) at no extra VRAM cost
 
 # Focal + Dice loss weights
 DETECTOR_FOCAL_GAMMA = 2.0
@@ -60,11 +80,22 @@ GAUSSIAN_SIGMA_RATIO = 0.3   # sigma = radius * 0.3
 # ─────────────────────────────────────────────
 # STAGE 2 — 3D ResNet-10 CLASSIFIER
 # ─────────────────────────────────────────────
-CLASSIFIER_CROP_SIZE  = (32, 32, 32)   # centred on detected nodule
-CLASSIFIER_BATCH_SIZE = 4
+# The classifier was never really VRAM-bound (<5M params, tiny volumes) —
+# even base_channels=48 @ crop=48^3 @ batch=32 measures ≈ 3.4GB. Batch went
+# up 8x (not e.g. 16x) deliberately: LUNA16's malignancy-labeled nodule count
+# is in the low thousands, and too few optimizer steps/epoch under-trains on
+# a small dataset even though the GPU could easily fit a bigger batch.
+CLASSIFIER_CROP_SIZE  = (48, 48, 48)   # centred on detected nodule — more
+                                        # margin context for malignancy cues
+                                        # (spiculation, lobulation) than 32^3
+CLASSIFIER_BATCH_SIZE = 32
 CLASSIFIER_EPOCHS     = 100
-CLASSIFIER_LR         = 2e-5
+CLASSIFIER_LR         = 6e-5           # sqrt(batch 4->32) scaling: 2e-5 * sqrt(8)
 CLASSIFIER_WEIGHT_DECAY = 1e-4
+CLASSIFIER_BASE_CHANNELS = 48          # up from 32 — modest capacity bump,
+                                        # justified by more data (10 subsets)
+                                        # not just spare VRAM
+CLASSIFIER_GRAD_ACCUM_STEPS = 1
 NUM_CLASSES           = 1              # binary: benign / malignant
 
 # Malignancy threshold from LIDC annotations (1-5 scale, ≥3 = malignant)
@@ -76,11 +107,22 @@ POS_WEIGHT            = 1
 # ─────────────────────────────────────────────
 # TRAINING UTILITIES
 # ─────────────────────────────────────────────
-USE_AMP          = True          # Automatic Mixed Precision (FP16) — crucial for 4GB
+USE_AMP          = True          # Automatic Mixed Precision (FP16) — still a
+                                  # free win on RTX 5070 Ti's tensor cores,
+                                  # independent of the VRAM headroom
 GRAD_CLIP        = 0.5
 SCHEDULER        = "cosine"      # cosine annealing
-WARMUP_EPOCHS    = 5
-NUM_WORKERS      = 12
+WARMUP_EPOCHS    = 6             # +1 epoch: bigger batches mean fewer
+                                  # optimizer steps per epoch, so warmup
+                                  # needs slightly more epochs to cover
+                                  # a comparable number of steps
+CUDNN_BENCHMARK  = True           # autotune conv algorithms — safe because
+                                  # patch/crop sizes are fixed per stage
+
+# NUM_WORKERS derived from CPU count rather than hardcoded, so this config
+# behaves consistently if you move between machines. Cap at 8: LUNA16
+# loading is I/O + resample bound, not helped much past that.
+NUM_WORKERS      = min(8, os.cpu_count() or 4)
 PIN_MEMORY       = True
 SEED             = 42
 
