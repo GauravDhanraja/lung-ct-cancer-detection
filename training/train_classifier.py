@@ -24,10 +24,12 @@ from sklearn.metrics import (roc_auc_score, roc_curve, average_precision_score,
                               confusion_matrix, classification_report)
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))         # this dir, for checkpoint_utils
+sys.path.insert(0, str(Path(__file__).parent.parent))  # project root, for config/models/data
 import config as cfg
 from data.dataset import get_classifier_loaders, SyntheticNoduleDataset
 from models.resnet3d import ResNet3D, LabelSmoothingBCE, count_params
+from checkpoint_utils import save_checkpoint_async, capture_rng_state, restore_rng_state
 
 
 # ═══════════════════════════════════════════════════════
@@ -270,9 +272,20 @@ def train_classifier(
                                           mode="classifier")
         train_ds, val_ds = random_split(full_ds, [240, 60])
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-        val_loader   = DataLoader(val_ds,   batch_size=batch_size*2, shuffle=False, num_workers=0)
+        val_batch = int(batch_size * cfg.CLASSIFIER_VAL_BATCH_MULTIPLIER)
+        val_loader   = DataLoader(val_ds,   batch_size=val_batch, shuffle=False, num_workers=0)
     else:
         train_loader, val_loader = get_classifier_loaders(batch_size=batch_size)
+
+    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    for name, loader in [("train_loader", train_loader), ("val_loader", val_loader)]:
+        nw = getattr(loader, "num_workers", 0)
+        persistent = getattr(loader, "persistent_workers", False)
+        if nw > 0 and not persistent:
+            print(f"  ⚠ {name} has num_workers={nw} but persistent_workers=False — "
+                  f"on Windows this respawns all {nw} worker processes every "
+                  f"epoch. Add persistent_workers=True to its DataLoader in "
+                  f"data/dataset.py (requires num_workers > 0, which you have).")
 
     # ── Model ──
     model   = ResNet3D(base_channels=cfg.CLASSIFIER_BASE_CHANNELS,
@@ -287,21 +300,36 @@ def train_classifier(
     scaler    = GradScaler("cuda", enabled=(cfg.USE_AMP and device == "cuda"))
 
     # Resume
-    start_epoch  = 0
-    best_val_auc = 0.0
+    start_epoch      = 0
+    best_val_auc     = 0.0
+    patience_counter = 0
+    history          = {"train": [], "val": []}
+    history_path     = cfg.RESULTS_DIR / "classifier_history.json"
+
     if resume_from and Path(resume_from).exists():
         ckpt = torch.load(resume_from, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch  = ckpt["epoch"] + 1
-        best_val_auc = ckpt.get("best_val_auc", 0.0)
-        print(f"Resumed from epoch {start_epoch}, best AUC: {best_val_auc:.4f}")
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+        start_epoch      = ckpt["epoch"] + 1
+        best_val_auc     = ckpt.get("best_val_auc", 0.0)
+        patience_counter = ckpt.get("patience_counter", 0)
+        restore_rng_state(ckpt.get("rng_state"))
+        print(f"Resumed from epoch {start_epoch}, best AUC: {best_val_auc:.4f}, "
+              f"patience_counter: {patience_counter}")
+
+        if history_path.exists():
+            with open(history_path) as f:
+                prior = json.load(f)
+            history["train"] = prior.get("train", [])[:start_epoch]
+            history["val"]   = prior.get("val", [])[:start_epoch]
 
     writer  = SummaryWriter(cfg.LOGS_DIR / "classifier")
-    history = {"train": [], "val": []}
     # Bumped from 25: batch 4->32 means ~8x fewer optimizer steps per epoch,
     # so it takes a few more epochs to see whether AUC is really plateauing.
-    patience, patience_counter = 35, 0
+    patience = 35
+    save_thread = None   # tracks the in-flight background checkpoint write
 
     for epoch in range(start_epoch, epochs):
         t0 = time.time()
@@ -321,9 +349,12 @@ def train_classifier(
                     f"lowering CLASSIFIER_BASE_CHANNELS / CLASSIFIER_CROP_SIZE."
                 ) from e
             raise
-        val_m   = val_epoch(model, val_loader, loss_fn, device)
+        t_train = time.time()
 
-        elapsed = time.time() - t0
+        val_m   = val_epoch(model, val_loader, loss_fn, device)
+        t_val = time.time()
+
+        train_s, val_s = t_train - t0, t_val - t_train
 
         for k, v in train_m.items():
             if not isinstance(v, list):
@@ -344,36 +375,64 @@ def train_classifier(
               f"  Train: loss={train_m['loss']:.4f}  AUC={train_m['auc']:.3f}"
               f"  Val:   loss={val_m['loss']:.4f}  AUC={val_m['auc']:.3f}"
               f"  Sens={val_m['sensitivity']:.3f}  Spec={val_m['specificity']:.3f}"
-              f"  ({elapsed:.0f}s)")
+              f"  (train={train_s:.0f}s val={val_s:.0f}s)")
 
         is_best = val_m["auc"] > best_val_auc
         if is_best:
             best_val_auc     = val_m["auc"]
             patience_counter = 0
-            torch.save({
-                "epoch"       : epoch,
-                "model"       : model.state_dict(),
-                "optimizer"   : optimizer.state_dict(),
-                "val_metrics" : val_log,
-                "best_val_auc": best_val_auc
-            }, cfg.CHECKPOINTS_DIR / "classifier_best.pth")
-            print(f"  ★  Saved best classifier (AUC={best_val_auc:.4f})")
         else:
             patience_counter += 1
 
+        resumable_ckpt = {
+            "epoch"           : epoch,
+            "model"           : model.state_dict(),
+            "optimizer"       : optimizer.state_dict(),
+            "scaler"          : scaler.state_dict(),
+            "val_metrics"     : val_log,
+            "best_val_auc"    : best_val_auc,
+            "patience_counter": patience_counter,
+            "rng_state"       : capture_rng_state(),
+        }
+
+        # classifier_last.pth — overwritten EVERY epoch; this is what
+        # --resume should point at so a shutdown never rolls you back to
+        # an older "best" epoch.
+        t_save0 = time.time()
+        save_thread = save_checkpoint_async(
+            resumable_ckpt, cfg.CHECKPOINTS_DIR / "classifier_last.pth", save_thread)
+        save_msg = f"main-thread cost: {time.time()-t_save0:.1f}s"
+
+        # classifier_best.pth — only overwritten on improvement; load this
+        # one for inference/deployment, not for resuming training.
+        if is_best:
+            save_thread = save_checkpoint_async(
+                resumable_ckpt, cfg.CHECKPOINTS_DIR / "classifier_best.pth", save_thread)
+            print(f"  ★  Saving best classifier (AUC={best_val_auc:.4f}) "
+                  f"in background — {save_msg}")
+
         if (epoch + 1) % 10 == 0:
-            torch.save({"epoch": epoch, "model": model.state_dict()},
-                       cfg.CHECKPOINTS_DIR / f"classifier_ep{epoch+1}.pth")
+            save_thread = save_checkpoint_async(
+                resumable_ckpt, cfg.CHECKPOINTS_DIR / f"classifier_ep{epoch+1}.pth", save_thread)
+
+        # Write history every epoch so a hard kill doesn't lose it.
+        with open(history_path, "w") as f:
+            json.dump(history, f, indent=2)
 
         if patience_counter >= patience:
             print(f"\nEarly stopping (no AUC improvement for {patience} epochs)")
             break
 
+    # Make sure the last checkpoint write has actually landed on disk before
+    # we report "done" or return control to the caller.
+    if save_thread is not None:
+        save_thread.join()
+
     writer.close()
-    with open(cfg.RESULTS_DIR / "classifier_history.json", "w") as f:
-        json.dump(history, f, indent=2)
 
     print(f"\n✓ Classifier training complete. Best val AUC: {best_val_auc:.4f}")
+    print(f"  Best checkpoint (for inference): {cfg.CHECKPOINTS_DIR}/classifier_best.pth")
+    print(f"  Latest checkpoint (for resume):  {cfg.CHECKPOINTS_DIR}/classifier_last.pth")
     return model, history
 
 
@@ -385,15 +444,27 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size",  type=int,   default=cfg.CLASSIFIER_BATCH_SIZE)
     parser.add_argument("--lr",          type=float, default=cfg.CLASSIFIER_LR)
     parser.add_argument("--no-mixup",    action="store_true")
-    parser.add_argument("--resume",      type=str,   default=None)
+    parser.add_argument("--resume",      type=str,   default=None,
+                        help="Path to a checkpoint, or 'auto' to resume from "
+                             "checkpoints/classifier_last.pth if it exists")
     parser.add_argument("--accum-steps", type=int,   default=cfg.CLASSIFIER_GRAD_ACCUM_STEPS,
                         help="Gradient accumulation steps (effective batch = batch_size * accum_steps)")
     parser.add_argument("--device",      type=str,   default="auto")
     args = parser.parse_args()
 
+    resume_path = args.resume
+    if resume_path == "auto":
+        auto_path = cfg.CHECKPOINTS_DIR / "classifier_last.pth"
+        if auto_path.exists():
+            resume_path = str(auto_path)
+            print(f"--resume auto -> found {auto_path}")
+        else:
+            print(f"--resume auto -> no checkpoint at {auto_path}, starting fresh")
+            resume_path = None
+
     train_classifier(
         use_synthetic = args.synthetic,
-        resume_from   = args.resume,
+        resume_from   = resume_path,
         epochs        = args.epochs,
         lr            = args.lr,
         batch_size    = args.batch_size,

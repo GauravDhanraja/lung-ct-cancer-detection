@@ -51,8 +51,8 @@ CLIP_RANGE      = (-1000, 400)
 # ─────────────────────────────────────────────
 # 96^3 patches (up from 64^3) give ~3.4x the spatial context per crop — more
 # surrounding anatomy for false-positive reduction, at the cost of a bigger
-# activation footprint. Measured: 96^3, standard channels, batch=6, with
-# gradient checkpointing on ≈ 13.1GB — safe on 16GB with headroom to spare.
+# activation footprint. Measured in practice: batch=6 training steady-state
+# ≈12.6GB, matching the earlier estimate well.
 DETECTOR_PATCH_SIZE  = (96, 96, 96)   # voxels
 DETECTOR_STRIDE      = (48, 48, 48)   # 50% overlap during sliding-window inference
 DETECTOR_BATCH_SIZE  = 6
@@ -67,6 +67,13 @@ DETECTOR_USE_CHECKPOINT = True        # kept on: ~20% slower but buys back
                                        # have >2-3GB free — it's a free speedup.
 DETECTOR_GRAD_ACCUM_STEPS = 1         # bump to 2-3 for a larger effective
                                        # batch (12-18) at no extra VRAM cost
+DETECTOR_VAL_BATCH_MULTIPLIER = 1.25  # val has no backward pass so it can run
+                                       # a bit bigger than train for free, but
+                                       # doubling (fine at the old batch=2) now
+                                       # pushes 6->12 and got measured at a
+                                       # ~15.5GB peak — too close to the 16GB
+                                       # ceiling. 1.25x (6->7) keeps the benefit
+                                       # with real margin.
 
 # Focal + Dice loss weights
 DETECTOR_FOCAL_GAMMA = 2.0
@@ -96,6 +103,11 @@ CLASSIFIER_BASE_CHANNELS = 48          # up from 32 — modest capacity bump,
                                         # justified by more data (10 subsets)
                                         # not just spare VRAM
 CLASSIFIER_GRAD_ACCUM_STEPS = 1
+CLASSIFIER_VAL_BATCH_MULTIPLIER = 2    # classifier has plenty of VRAM
+                                        # headroom (~3.4GB at batch=32), so
+                                        # doubling for val is safe here —
+                                        # unlike the detector, this one
+                                        # isn't close to any ceiling
 NUM_CLASSES           = 1              # binary: benign / malignant
 
 # Malignancy threshold from LIDC annotations (1-5 scale, ≥3 = malignant)

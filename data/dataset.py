@@ -299,6 +299,7 @@ def get_detector_loaders(
         sampler     = sampler,
         shuffle     = (sampler is None),
         num_workers = num_workers,
+        persistent_workers=True,
         pin_memory  = cfg.PIN_MEMORY,
         drop_last   = True
     )
@@ -307,6 +308,7 @@ def get_detector_loaders(
         batch_size  = batch_size * 2,
         shuffle     = False,
         num_workers = num_workers,
+        persistent_workers=True,
         pin_memory  = cfg.PIN_MEMORY
     )
     print(f"Detector  — train: {len(train_ds)}, val: {len(val_ds)}")
@@ -328,6 +330,7 @@ def get_classifier_loaders(
         sampler     = sampler,
         shuffle     = (sampler is None),
         num_workers = num_workers,
+        persistent_workers=True,
         pin_memory  = cfg.PIN_MEMORY,
         drop_last   = True
     )
@@ -336,6 +339,7 @@ def get_classifier_loaders(
         batch_size  = batch_size * 2,
         shuffle     = False,
         num_workers = num_workers,
+        persistent_workers=True,
         pin_memory  = cfg.PIN_MEMORY
     )
     print(f"Classifier— train: {len(train_ds)}, val: {len(val_ds)}")
