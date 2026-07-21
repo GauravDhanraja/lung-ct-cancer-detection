@@ -255,7 +255,13 @@ def train_detector(
     history_path     = cfg.RESULTS_DIR / "detector_history.json"
 
     if resume_from and Path(resume_from).exists():
-        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        # map_location='cpu' (not `device`): the model/optimizer are already
+        # on `device` (created above), and load_state_dict / optimizer's
+        # state loading both copy CPU data into existing device tensors
+        # transparently. Loading straight to `device` would also move the
+        # RNG state tensors onto the GPU, where torch.set_rng_state() can't
+        # use them (it specifically requires a CPU torch.ByteTensor).
+        ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scaler" in ckpt:
@@ -326,7 +332,9 @@ def train_detector(
               f"  Val:   loss={val_metrics['loss']:.4f}  dice={val_metrics['dice']:.3f}"
               f"  (train={train_s:.0f}s val={val_s:.0f}s)")
 
-        # ── Checkpoint — save when val DICE improves (async, non-blocking) ──
+        # ── Checkpoint — one CPU copy, one background thread, all destinations ──
+        # (see save_checkpoint_async's docstring for why this must be a single
+        # call with a list of paths rather than one call per destination)
         is_best = val_metrics["dice"] > best_val_dice
         if is_best:
             best_val_dice    = val_metrics["dice"]
@@ -334,7 +342,6 @@ def train_detector(
         else:
             patience_counter += 1
 
-        # Common resumable state, shared by the "best" and "last" checkpoints
         resumable_ckpt = {
             "epoch"           : epoch,
             "model"           : model.state_dict(),
@@ -347,30 +354,24 @@ def train_detector(
             "rng_state"       : capture_rng_state(),
         }
 
-        # detector_last.pth — overwritten EVERY epoch. This is what --resume
-        # should point at: it always reflects the most recent completed
-        # epoch, regardless of whether that epoch was "best". Without this,
-        # resuming after a non-improving stretch would silently roll you
-        # back to the last epoch that happened to improve val dice, which
-        # can be many epochs behind where you actually stopped.
-        t_save0 = time.time()
-        save_thread = save_checkpoint_async(
-            resumable_ckpt, cfg.CHECKPOINTS_DIR / "detector_last.pth", save_thread)
-        save_msg = f"main-thread cost: {time.time()-t_save0:.1f}s"
-
-        # detector_best.pth — only overwritten on improvement. This is the
-        # one to load for inference/deployment, not for resuming training.
+        # detector_last.pth — always written; this is what --resume uses, so
+        # it always reflects the most recent completed epoch regardless of
+        # whether that epoch was "best".
+        save_paths = [cfg.CHECKPOINTS_DIR / "detector_last.pth"]
+        # detector_best.pth — only on improvement; load this one for
+        # inference/deployment, not for resuming training.
         if is_best:
-            save_thread = save_checkpoint_async(
-                resumable_ckpt, cfg.CHECKPOINTS_DIR / "detector_best.pth", save_thread)
-            print(f"  ★  Saving best detector (val_dice={best_val_dice:.4f}) "
-                  f"in background — {save_msg}")
-
+            save_paths.append(cfg.CHECKPOINTS_DIR / "detector_best.pth")
         # Periodic named snapshot every 10 epochs — a rollback point that
         # detector_last.pth being overwritten every epoch can't provide.
         if (epoch + 1) % 10 == 0:
-            save_thread = save_checkpoint_async(
-                resumable_ckpt, cfg.CHECKPOINTS_DIR / f"detector_ep{epoch+1}.pth", save_thread)
+            save_paths.append(cfg.CHECKPOINTS_DIR / f"detector_ep{epoch+1}.pth")
+
+        t_save0 = time.time()
+        save_thread = save_checkpoint_async(resumable_ckpt, save_paths, save_thread)
+        if is_best:
+            print(f"  ★  Saving best detector (val_dice={best_val_dice:.4f}) "
+                  f"in background — main-thread cost: {time.time()-t_save0:.1f}s")
 
         # Write history every epoch (not just at the end) so a hard kill —
         # exactly the "shut the machine down" scenario — doesn't lose it.

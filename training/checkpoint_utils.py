@@ -40,29 +40,43 @@ def _move_to_cpu(obj):
     return obj
 
 
-def _write_atomically(obj, path: Path):
+def _write_atomically(obj, path):
+    path = Path(path)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(obj, tmp_path)
     os.replace(tmp_path, path)   # atomic on both Windows and POSIX
 
 
-def save_checkpoint_async(ckpt: dict, path: Path,
-                           prev_thread: Optional[threading.Thread]) -> threading.Thread:
+def _write_to_all(obj, paths):
+    for path in paths:
+        _write_atomically(obj, path)
+
+
+def save_checkpoint_async(ckpt: dict, paths, prev_thread: Optional[threading.Thread]) -> threading.Thread:
     """
     Snapshot ckpt's tensors to CPU synchronously (fast — a D2H copy, not a
     disk write), then write to disk on a background thread (slow, but no
-    longer blocks the training loop). Joins prev_thread first so writes to
-    the same path never overlap — in the normal case prev_thread is already
-    done and this join is instant.
+    longer blocks the training loop). Joins prev_thread first so writes
+    never overlap — in the normal case prev_thread is already done and this
+    join is instant.
+
+    `paths` can be a single Path or a list of Paths — pass a list (e.g.
+    [last_path, best_path] on an improving epoch) rather than calling this
+    function twice in a row: two separate calls means the *second* call's
+    prev_thread.join() waits for the *first* call's write to finish, which
+    can silently block the training loop on a slow disk. Writing to all
+    destinations from one background thread avoids that trap entirely.
 
     Call save_thread.join() once more after your training loop ends, to
     make sure the very last checkpoint has actually landed on disk before
     you report "done" or return control to the caller.
     """
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
     if prev_thread is not None and prev_thread.is_alive():
         prev_thread.join()
     cpu_ckpt = _move_to_cpu(ckpt)   # synchronous but cheap (D2H copy only)
-    t = threading.Thread(target=_write_atomically, args=(cpu_ckpt, path), daemon=True)
+    t = threading.Thread(target=_write_to_all, args=(cpu_ckpt, paths), daemon=True)
     t.start()
     return t
 
@@ -86,8 +100,8 @@ def restore_rng_state(state: Optional[dict]):
     if not state:
         return
     if "torch" in state:
-        torch.set_rng_state(state["torch"])
+        torch.set_rng_state(state["torch"].cpu())
     if "numpy" in state:
         np.random.set_state(state["numpy"])
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        torch.cuda.set_rng_state_all([t.cpu() for t in state["cuda"]])

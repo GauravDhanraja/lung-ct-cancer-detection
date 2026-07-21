@@ -307,7 +307,13 @@ def train_classifier(
     history_path     = cfg.RESULTS_DIR / "classifier_history.json"
 
     if resume_from and Path(resume_from).exists():
-        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        # map_location='cpu' (not `device`): the model/optimizer are already
+        # on `device` (created above), and load_state_dict / optimizer's
+        # state loading both copy CPU data into existing device tensors
+        # transparently. Loading straight to `device` would also move the
+        # RNG state tensors onto the GPU, where torch.set_rng_state() can't
+        # use them (it specifically requires a CPU torch.ByteTensor).
+        ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scaler" in ckpt:
@@ -395,25 +401,18 @@ def train_classifier(
             "rng_state"       : capture_rng_state(),
         }
 
-        # classifier_last.pth — overwritten EVERY epoch; this is what
-        # --resume should point at so a shutdown never rolls you back to
-        # an older "best" epoch.
-        t_save0 = time.time()
-        save_thread = save_checkpoint_async(
-            resumable_ckpt, cfg.CHECKPOINTS_DIR / "classifier_last.pth", save_thread)
-        save_msg = f"main-thread cost: {time.time()-t_save0:.1f}s"
-
-        # classifier_best.pth — only overwritten on improvement; load this
-        # one for inference/deployment, not for resuming training.
+        # ── Checkpoint — one CPU copy, one background thread, all destinations ──
+        save_paths = [cfg.CHECKPOINTS_DIR / "classifier_last.pth"]
         if is_best:
-            save_thread = save_checkpoint_async(
-                resumable_ckpt, cfg.CHECKPOINTS_DIR / "classifier_best.pth", save_thread)
-            print(f"  ★  Saving best classifier (AUC={best_val_auc:.4f}) "
-                  f"in background — {save_msg}")
-
+            save_paths.append(cfg.CHECKPOINTS_DIR / "classifier_best.pth")
         if (epoch + 1) % 10 == 0:
-            save_thread = save_checkpoint_async(
-                resumable_ckpt, cfg.CHECKPOINTS_DIR / f"classifier_ep{epoch+1}.pth", save_thread)
+            save_paths.append(cfg.CHECKPOINTS_DIR / f"classifier_ep{epoch+1}.pth")
+
+        t_save0 = time.time()
+        save_thread = save_checkpoint_async(resumable_ckpt, save_paths, save_thread)
+        if is_best:
+            print(f"  ★  Saving best classifier (AUC={best_val_auc:.4f}) "
+                  f"in background — main-thread cost: {time.time()-t_save0:.1f}s")
 
         # Write history every epoch so a hard kill doesn't lose it.
         with open(history_path, "w") as f:
