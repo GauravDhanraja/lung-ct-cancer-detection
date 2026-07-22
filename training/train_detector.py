@@ -4,11 +4,11 @@ training/train_detector.py
 Training loop for the 3D U-Net nodule detector.
 
 Features:
-  • Automatic Mixed Precision (FP16)  → fits 4GB VRAM
+  • Automatic Mixed Precision (FP16)
   • Cosine LR scheduler with warmup
-  • Gradient clipping
+  • Gradient clipping, gradient accumulation
   • TensorBoard logging
-  • Best-model checkpointing by val loss
+  • Async, atomic, resumable checkpointing (see checkpoint_utils.py)
   • Early stopping
 """
 
@@ -25,12 +25,13 @@ from tqdm import tqdm
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))         # this dir, for checkpoint_utils
-sys.path.insert(0, str(Path(__file__).parent.parent))  # project root, for config/models/data
+sys.path.insert(0, str(Path(__file__).parent.parent))  # project root, for config/models/data/model_factory
 import config as cfg
 from data.dataset import get_detector_loaders, SyntheticNoduleDataset
-from models.unet3d import UNet3D, FocalDiceLoss, count_params
+from models.unet3d import FocalDiceLoss, count_params
 from torch.utils.data import DataLoader
 from checkpoint_utils import save_checkpoint_async, capture_rng_state, restore_rng_state
+from model_factory import build_detector, detector_arch, warn_on_arch_mismatch
 
 
 # ═══════════════════════════════════════════════════════
@@ -235,8 +236,23 @@ def train_detector(
                   f"epoch. Add persistent_workers=True to its DataLoader in "
                   f"data/dataset.py (requires num_workers > 0, which you have).")
 
+    # ── Optional resume: peek the checkpoint's architecture FIRST ──
+    # (before building model/optimizer/scheduler) so there's never a need to
+    # rebuild them mid-function — rebuilding model after scheduler exists
+    # would leave the scheduler holding a reference to a discarded optimizer.
+    ckpt = None
+    ckpt_channels = None
+    if resume_from and Path(resume_from).exists():
+        # map_location='cpu': avoids moving RNG state tensors onto the GPU,
+        # where torch.set_rng_state() can't use them (it specifically
+        # requires a CPU torch.ByteTensor). Model/optimizer get moved to
+        # `device` explicitly below instead.
+        ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
+        warn_on_arch_mismatch(ckpt.get("arch", {}), detector_arch(), "Detector")
+        ckpt_channels = ckpt.get("arch", {}).get("channels")
+
     # ── Model ──
-    model = UNet3D(use_checkpoint=use_checkpoint).to(device)
+    model = build_detector(device=device, channels=ckpt_channels, use_checkpoint=use_checkpoint)
     total, trainable = count_params(model)
     print(f"Parameters: {total/1e6:.2f}M total, {trainable/1e6:.2f}M trainable\n")
 
@@ -247,21 +263,14 @@ def train_detector(
     loss_fn   = FocalDiceLoss()
     scaler    = GradScaler("cuda", enabled=(cfg.USE_AMP and device == "cuda"))
 
-    # ── Optional resume ──
+    # ── Apply resume state (model built above already matches ckpt's arch) ──
     start_epoch      = 0
     best_val_dice    = 0.0          # monitor dice, not loss
     patience_counter = 0
     history          = {"train": [], "val": []}
     history_path     = cfg.RESULTS_DIR / "detector_history.json"
 
-    if resume_from and Path(resume_from).exists():
-        # map_location='cpu' (not `device`): the model/optimizer are already
-        # on `device` (created above), and load_state_dict / optimizer's
-        # state loading both copy CPU data into existing device tensors
-        # transparently. Loading straight to `device` would also move the
-        # RNG state tensors onto the GPU, where torch.set_rng_state() can't
-        # use them (it specifically requires a CPU torch.ByteTensor).
-        ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
+    if ckpt is not None:
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scaler" in ckpt:
@@ -333,8 +342,6 @@ def train_detector(
               f"  (train={train_s:.0f}s val={val_s:.0f}s)")
 
         # ── Checkpoint — one CPU copy, one background thread, all destinations ──
-        # (see save_checkpoint_async's docstring for why this must be a single
-        # call with a list of paths rather than one call per destination)
         is_best = val_metrics["dice"] > best_val_dice
         if is_best:
             best_val_dice    = val_metrics["dice"]
@@ -352,6 +359,7 @@ def train_detector(
             "best_val_dice"   : best_val_dice,
             "patience_counter": patience_counter,
             "rng_state"       : capture_rng_state(),
+            "arch"            : detector_arch(),
         }
 
         # detector_last.pth — always written; this is what --resume uses, so

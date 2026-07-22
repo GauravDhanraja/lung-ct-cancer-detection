@@ -7,6 +7,7 @@ Key additions over the detector trainer:
   • AUC-ROC monitoring (primary metric for clinical relevance)
   • Mixup augmentation for 3D volumes (reduces overfitting on small datasets)
   • Test-Time Augmentation (TTA) for robust probability estimation
+  • Async, atomic, resumable checkpointing (see checkpoint_utils.py)
 """
 
 import sys, time, json
@@ -25,11 +26,12 @@ from sklearn.metrics import (roc_auc_score, roc_curve, average_precision_score,
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))         # this dir, for checkpoint_utils
-sys.path.insert(0, str(Path(__file__).parent.parent))  # project root, for config/models/data
+sys.path.insert(0, str(Path(__file__).parent.parent))  # project root, for config/models/data/model_factory
 import config as cfg
 from data.dataset import get_classifier_loaders, SyntheticNoduleDataset
-from models.resnet3d import ResNet3D, LabelSmoothingBCE, count_params
+from models.resnet3d import LabelSmoothingBCE, count_params
 from checkpoint_utils import save_checkpoint_async, capture_rng_state, restore_rng_state
+from model_factory import build_classifier, classifier_arch, warn_on_arch_mismatch
 
 
 # ═══════════════════════════════════════════════════════
@@ -287,9 +289,18 @@ def train_classifier(
                   f"epoch. Add persistent_workers=True to its DataLoader in "
                   f"data/dataset.py (requires num_workers > 0, which you have).")
 
+    # ── Optional resume: peek the checkpoint's architecture FIRST ──
+    # (before building model/optimizer/scheduler) so there's never a need to
+    # rebuild them mid-function.
+    ckpt = None
+    ckpt_base_channels = None
+    if resume_from and Path(resume_from).exists():
+        ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
+        warn_on_arch_mismatch(ckpt.get("arch", {}), classifier_arch(), "Classifier")
+        ckpt_base_channels = ckpt.get("arch", {}).get("base_channels")
+
     # ── Model ──
-    model   = ResNet3D(base_channels=cfg.CLASSIFIER_BASE_CHANNELS,
-                        use_se=True, dropout=0.4).to(device)
+    model   = build_classifier(device=device, base_channels=ckpt_base_channels, dropout=0.4)
     loss_fn = LabelSmoothingBCE(smoothing=0.0)
     total, trainable = count_params(model)
     print(f"Parameters: {total/1e6:.3f}M\n")
@@ -299,21 +310,14 @@ def train_classifier(
     scheduler = WarmupCosineScheduler(optimizer, cfg.WARMUP_EPOCHS, epochs)
     scaler    = GradScaler("cuda", enabled=(cfg.USE_AMP and device == "cuda"))
 
-    # Resume
+    # ── Apply resume state (model built above already matches ckpt's arch) ──
     start_epoch      = 0
     best_val_auc     = 0.0
     patience_counter = 0
     history          = {"train": [], "val": []}
     history_path     = cfg.RESULTS_DIR / "classifier_history.json"
 
-    if resume_from and Path(resume_from).exists():
-        # map_location='cpu' (not `device`): the model/optimizer are already
-        # on `device` (created above), and load_state_dict / optimizer's
-        # state loading both copy CPU data into existing device tensors
-        # transparently. Loading straight to `device` would also move the
-        # RNG state tensors onto the GPU, where torch.set_rng_state() can't
-        # use them (it specifically requires a CPU torch.ByteTensor).
-        ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
+    if ckpt is not None:
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scaler" in ckpt:
@@ -399,6 +403,7 @@ def train_classifier(
             "best_val_auc"    : best_val_auc,
             "patience_counter": patience_counter,
             "rng_state"       : capture_rng_state(),
+            "arch"            : classifier_arch(),
         }
 
         # ── Checkpoint — one CPU copy, one background thread, all destinations ──

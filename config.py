@@ -99,7 +99,7 @@ CLASSIFIER_BATCH_SIZE = 32
 CLASSIFIER_EPOCHS     = 100
 CLASSIFIER_LR         = 6e-5           # sqrt(batch 4->32) scaling: 2e-5 * sqrt(8)
 CLASSIFIER_WEIGHT_DECAY = 1e-4
-CLASSIFIER_BASE_CHANNELS = 48          # up from 32 — modest capacity bump,
+CLASSIFIER_BASE_CHANNELS = 32          # up from 32 — modest capacity bump,
                                         # justified by more data (10 subsets)
                                         # not just spare VRAM
 CLASSIFIER_GRAD_ACCUM_STEPS = 1

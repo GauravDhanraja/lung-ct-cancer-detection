@@ -20,6 +20,20 @@ sys.path.insert(0, str(Path(__file__).parent))
 import config as cfg
 
 
+def _resolve_resume(resume_arg, auto_path: Path):
+    """Shared 'auto' resume resolution, matching train_detector.py/
+    train_classifier.py's own CLI behavior, so `python main.py train-det
+    --resume auto` and `python training/train_detector.py --resume auto`
+    do the same thing."""
+    if resume_arg != "auto":
+        return resume_arg
+    if auto_path.exists():
+        print(f"--resume auto -> found {auto_path}")
+        return str(auto_path)
+    print(f"--resume auto -> no checkpoint at {auto_path}, starting fresh")
+    return None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Lung CT Nodule Detection & Malignancy Prediction",
@@ -47,9 +61,16 @@ Examples:
     parser.add_argument("--epochs",     type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr",         type=float, default=None)
-    parser.add_argument("--resume",     default=None)
+    parser.add_argument("--resume",     default=None,
+                        help="Path to a checkpoint, or 'auto' to resume the "
+                             "most recent run for this stage")
     parser.add_argument("--synthetic",  action="store_true",
                         help="Use synthetic data (no LUNA16 needed)")
+    parser.add_argument("--accum-steps", type=int, default=None,
+                        help="Gradient accumulation steps (train-det/train-cls only)")
+    parser.add_argument("--no-checkpoint", action="store_true",
+                        help="Disable gradient checkpointing (train-det only, "
+                             "faster but uses more VRAM)")
 
     # Infer-specific
     parser.add_argument("--scan",       default=None)
@@ -96,10 +117,12 @@ def main():
         from training.train_detector import train_detector
         train_detector(
             use_synthetic = args.synthetic,
-            resume_from   = args.resume,
+            resume_from   = _resolve_resume(args.resume, cfg.CHECKPOINTS_DIR / "detector_last.pth"),
             epochs        = args.epochs or cfg.DETECTOR_EPOCHS,
             lr            = args.lr    or cfg.DETECTOR_LR,
             batch_size    = args.batch_size or cfg.DETECTOR_BATCH_SIZE,
+            use_checkpoint= cfg.DETECTOR_USE_CHECKPOINT and not args.no_checkpoint,
+            accum_steps   = args.accum_steps or cfg.DETECTOR_GRAD_ACCUM_STEPS,
             device        = args.device
         )
 
@@ -108,10 +131,11 @@ def main():
         from training.train_classifier import train_classifier
         train_classifier(
             use_synthetic = args.synthetic,
-            resume_from   = args.resume,
+            resume_from   = _resolve_resume(args.resume, cfg.CHECKPOINTS_DIR / "classifier_last.pth"),
             epochs        = args.epochs or cfg.CLASSIFIER_EPOCHS,
             lr            = args.lr    or cfg.CLASSIFIER_LR,
             batch_size    = args.batch_size or cfg.CLASSIFIER_BATCH_SIZE,
+            accum_steps   = args.accum_steps or cfg.CLASSIFIER_GRAD_ACCUM_STEPS,
             device        = args.device
         )
 
@@ -144,12 +168,11 @@ def run_evaluation(args):
     import numpy as np
     from torch.amp import autocast
     from tqdm import tqdm
-    from models.unet3d import UNet3D
-    from models.resnet3d import ResNet3D
     from data.dataset import get_classifier_loaders, SyntheticNoduleDataset
     from torch.utils.data import DataLoader
     from evaluation.metrics import (compute_classification_metrics,
                                      plot_roc, plot_training_history)
+    from model_factory import load_classifier_checkpoint, build_classifier
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.device != "auto":
@@ -159,20 +182,24 @@ def run_evaluation(args):
 
     # ── Classifier evaluation ──
     cls_ckpt = cfg.CHECKPOINTS_DIR / "classifier_best.pth"
-    classifier = ResNet3D(use_se=True, dropout=0.0).to(device)
 
     if cls_ckpt.exists():
-        ckpt = torch.load(cls_ckpt, map_location=device, weights_only=False)
-        classifier.load_state_dict(ckpt["model"])
+        # load_classifier_checkpoint reconstructs the model to match
+        # whatever architecture THIS checkpoint was actually trained with
+        # (recorded in its "arch" key), rather than trusting config.py to
+        # still match — config.py can drift (e.g. CLASSIFIER_BASE_CHANNELS
+        # changed) between training and evaluation without this.
+        classifier, _ = load_classifier_checkpoint(cls_ckpt, device=device, dropout=0.0)
         print(f"Loaded classifier: {cls_ckpt}")
     else:
         print("⚠  No classifier checkpoint found — using random weights")
+        classifier = build_classifier(device=device, dropout=0.0)
 
     classifier.eval()
 
     # Data
     if args.synthetic:
-        full_ds = SyntheticNoduleDataset(n_samples=200, patch_size=(32,32,32),
+        full_ds = SyntheticNoduleDataset(n_samples=200, patch_size=cfg.CLASSIFIER_CROP_SIZE,
                                           mode="classifier")
         val_loader = DataLoader(full_ds, batch_size=16, shuffle=False)
     else:
@@ -235,6 +262,17 @@ def run_evaluation(args):
 
     print(f"✓ Evaluation complete. Results saved to {cfg.RESULTS_DIR}/")
 
+    # NOTE: this function only evaluates the classifier. The module
+    # docstring at the top of this file says "evaluate -> FROC +
+    # classification metrics", but there's no detector/FROC evaluation
+    # here or anywhere else I've seen in this project (would need
+    # sliding-window inference via UNet3D.predict_volume, NMS on candidate
+    # detections, and matching against ground-truth nodule locations —
+    # none of which I have visibility into without evaluation/metrics.py
+    # and a detector-specific validation loader). If you want this closed,
+    # share those files and I'll wire it in using model_factory the same
+    # way the classifier path above does.
+
 
 # ═══════════════════════════════════════════════════════
 # UNIT TESTS
@@ -249,20 +287,23 @@ def run_unit_tests():
 
     # Test 1: Models
     try:
-        from models.unet3d import UNet3D, FocalDiceLoss
-        m = UNet3D()
-        x = torch.randn(1, 1, 64, 64, 64)
+        from model_factory import build_detector
+        from models.unet3d import FocalDiceLoss
+        m = build_detector(device="cpu")
+        p = cfg.DETECTOR_PATCH_SIZE
+        x = torch.randn(1, 1, *p)
         y = m(x)
-        assert y.shape == (1, 1, 64, 64, 64), f"Wrong shape: {y.shape}"
+        assert y.shape == (1, 1, *p), f"Wrong shape: {y.shape}"
         print("  ✓ UNet3D forward pass")
         tests_passed += 1
     except Exception as e:
         print(f"  ✗ UNet3D: {e}")
 
     try:
-        from models.resnet3d import ResNet3D
-        m = ResNet3D()
-        x = torch.randn(4, 1, 32, 32, 32)
+        from model_factory import build_classifier
+        m = build_classifier(device="cpu")
+        c = cfg.CLASSIFIER_CROP_SIZE
+        x = torch.randn(4, 1, *c)
         y = m(x)
         assert y.shape == (4, 1), f"Wrong shape: {y.shape}"
         f = m.forward_features(x)
@@ -289,12 +330,13 @@ def run_unit_tests():
     # Test 3: Grad-CAM
     try:
         from explainability.gradcam3d import GradCAM3D
-        from models.resnet3d import ResNet3D
-        model = ResNet3D().eval()
+        from model_factory import build_classifier
+        model = build_classifier(device="cpu").eval()
         cam   = GradCAM3D(model, model.layer3)
-        x     = torch.randn(1, 1, 32, 32, 32)
+        c     = cfg.CLASSIFIER_CROP_SIZE
+        x     = torch.randn(1, 1, *c)
         h, p  = cam(x)
-        assert h.shape == (32, 32, 32)
+        assert h.shape == c
         assert 0.0 <= h.max() <= 1.0
         cam.remove_hooks()
         print("  ✓ Grad-CAM 3D")
