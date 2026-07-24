@@ -21,7 +21,7 @@ matplotlib.use("Agg")   # headless rendering
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from scipy.ndimage import label as scipy_label, center_of_mass
-from sklearn.metrics import roc_curve, auc, precision_recall_curve
+from sklearn.metrics import roc_curve, auc
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import config as cfg
@@ -237,15 +237,22 @@ def compute_classification_metrics(
                         accuracy, F1, Youden-J threshold
     """
     from sklearn.metrics import (accuracy_score, f1_score,
-                                  balanced_accuracy_score)
+                                  balanced_accuracy_score, average_precision_score)
 
     # ROC
     fpr, tpr, thresholds = roc_curve(y_true, y_prob)
     roc_auc = auc(fpr, tpr)
 
-    # Precision-Recall
-    prec, rec, pr_thresh = precision_recall_curve(y_true, y_prob)
-    avg_prec = float(np.trapezoid(rec[::-1], prec[::-1]))  # AP
+    # Average Precision — use sklearn's implementation directly rather than
+    # a manual trapezoidal integral over precision_recall_curve's output.
+    # (The previous version called np.trapezoid(rec[::-1], prec[::-1]) —
+    # y and x swapped, integrating recall w.r.t. precision instead of
+    # precision w.r.t. recall. Since precision isn't monotonic in recall,
+    # that produces negative contributions and can go negative overall,
+    # which AP can never legitimately do. average_precision_score also
+    # matches the standard step-function AP definition used everywhere
+    # else in this codebase, e.g. train_classifier.py's own per-epoch "ap".)
+    avg_prec = float(average_precision_score(y_true, y_prob))
 
     # Youden's J index (maximise sens + spec)
     j_scores     = tpr - fpr
